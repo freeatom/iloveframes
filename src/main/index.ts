@@ -2,7 +2,7 @@ import {
   app, BrowserWindow, ipcMain, screen, desktopCapturer, protocol, dialog, shell,
   systemPreferences, globalShortcut, session, Display, nativeImage, clipboard, net
 } from 'electron'
-import { join, extname, basename } from 'path'
+import { join, extname, basename, resolve, relative, isAbsolute } from 'path'
 import { CONFIG } from './config'
 import { projectName } from '../shared/naming'
 import { checkForUpdates, installNow, startAutoUpdates, updateState } from './updater'
@@ -10,6 +10,7 @@ import { promises as fsp, createReadStream, existsSync, statSync, mkdirSync } fr
 import { Readable } from 'stream'
 import { randomUUID } from 'crypto'
 import { tmpdir } from 'os'
+import { fileURLToPath } from 'url'
 import { InputTracker, startNativeCapture } from './recorder'
 import { runFfmpeg, LiveCapture, captureOutput, cropFilter, type CropFrac } from './ffmpeg'
 import { initLicense, status as licenseStatus, isUnlocked, activate as licenseActivate, deactivate as licenseDeactivate, setName as licenseSetName } from './license'
@@ -74,7 +75,17 @@ function createMainWindow() {
 // ---------------------------------------------------------------------------
 // Media protocol with Range support (smooth seeking in <video>)
 // ---------------------------------------------------------------------------
-const MIME: Record<string, string> = { '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.mp4': 'video/mp4', '.webm': 'video/webm', '.jpg': 'image/jpeg', '.png': 'image/png', '.json': 'application/json', '.wav': 'audio/wav' }
+const MIME: Record<string, string> = { '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.mp4': 'video/mp4', '.webm': 'video/webm', '.jpg': 'image/jpeg', '.png': 'image/png', '.wav': 'audio/wav' }
+
+/** True if `file` is inside `root` (after resolving `..`). Case-insensitive on Windows. */
+function isInside(root: string, file: string) {
+  const norm = (p: string) => (process.platform === 'win32' ? resolve(p).toLowerCase() : resolve(p))
+  const rel = relative(norm(root), norm(file))
+  return !!rel && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/** Folders ilf://media may serve from: projects, imported wallpapers/sounds, bundled wallpapers. */
+const mediaRoots = () => [projectsRoot(), app.getPath('userData'), bundledWallpaperDir()]
 
 function registerMediaProtocol() {
   protocol.handle('ilf', async (req) => {
@@ -82,6 +93,8 @@ function registerMediaProtocol() {
     // ilf://media/<abs path encoded>, or ilf://wallpaper/<file> for the wallpapers that ship with the app
     const rest = decodeURIComponent(url.pathname.replace(/^\//, ''))
     const file = url.hostname === 'wallpaper' ? join(bundledWallpaperDir(), basename(rest)) : rest
+    // only media files from the app's own folders: never an arbitrary file on disk
+    if (!MIME[extname(file).toLowerCase()] || !mediaRoots().some((r) => isInside(r, file))) return new Response('forbidden', { status: 403 })
     if (!existsSync(file)) return new Response('not found', { status: 404 })
     const size = statSync(file).size
     const type = MIME[extname(file).toLowerCase()] || 'application/octet-stream'
@@ -259,8 +272,10 @@ ipcMain.handle('rec:prepare', async (_e, opts: { displayId: string; countdown: n
 })
 
 const writeChains = new Map<string, Promise<void>>()
+const CHUNK_KINDS = new Set(['screen', 'camera', 'mic'])
 ipcMain.on('rec:chunk', (_e, kind: string, data: ArrayBuffer) => {
-  if (!rec) return
+  // `kind` becomes a file name: only the known streams, never a path
+  if (!rec || !CHUNK_KINDS.has(kind)) return
   const file = join(rec.dir, kind + '.webm')
   const next = (writeChains.get(file) ?? Promise.resolve()).then(() => fsp.appendFile(file, Buffer.from(data))).catch(() => {})
   writeChains.set(file, next)
@@ -592,7 +607,16 @@ ipcMain.handle('perm:request', async (_e, kind: 'camera' | 'microphone' | 'acces
 })
 
 ipcMain.handle('shell:reveal', (_e, p: string) => shell.showItemInFolder(p))
-ipcMain.handle('shell:open', (_e, p: string) => shell.openPath(p))
+// opens a folder, or an exported video/image in its default app; never anything executable
+const OPENABLE_EXT = ['.mp4', '.gif', '.png', '.jpg', '.jpeg', '.webm', '.mov']
+ipcMain.handle('shell:open', async (_e, p: string) => {
+  if (typeof p !== 'string' || !isAbsolute(p)) return 'Not allowed'
+  const st = await fsp.stat(p).catch(() => null)
+  const ext = extname(p).toLowerCase()
+  // (a macOS .app is a folder too, and opening it launches it)
+  if (!st || !((st.isDirectory() && ext !== '.app') || (st.isFile() && OPENABLE_EXT.includes(ext)))) return 'Not allowed'
+  return shell.openPath(p)
+})
 ipcMain.handle('app:info', () => ({ platform: process.platform, version: app.getVersion(), projectsDir: projectsRoot() }))
 ipcMain.handle('file:pick-image', async () => {
   const r = await dialog.showOpenDialog(mainWin!, { properties: ['openFile'], filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] })
@@ -667,22 +691,26 @@ async function importRecording(p: string, dir: string, id: string, label: string
     if (data.camera) {
       progress(0.6)
       const cam = `cam-${id}.mp4`
-      const off = data.camera.offset
+      const off = Number(data.camera.offset) || 0
       await runFfmpeg(['-i', p, '-map', '0:v:1', '-c', 'copy', '-movflags', '+faststart', join(dir, cam)])
         .then(() => (camera = { file: cam, offset: off }))
         .catch(() => {})
     }
   } else {
-    const mic = sib.mic && existsSync(join(sib.dir, sib.mic.file)) ? sib.mic : null
+    // project.json next to an imported file is untrusted: plain file names and numbers only
+    const local = (f: unknown) => (typeof f === 'string' && f ? join(sib.dir, basename(f)) : '')
+    const micFile = local(sib.mic?.file)
+    const mic = micFile && existsSync(micFile) ? { offset: Number(sib.mic.offset) || 0 } : null
     await runFfmpeg([
       '-i', p,
-      ...(mic ? ['-i', join(sib.dir, mic.file), '-filter_complex', alignAudio(1, mic.offset, sib.duration), '-map', '0:v:0', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k'] : ['-map', '0:v:0']),
+      ...(mic ? ['-i', micFile, '-filter_complex', alignAudio(1, mic.offset, Number(sib.duration) || 0), '-map', '0:v:0', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k'] : ['-map', '0:v:0']),
       '-c:v', 'copy', '-movflags', '+faststart', join(dir, file)
     ])
-    if (sib.camera && existsSync(join(sib.dir, sib.camera.file))) {
+    const camFile = local(sib.camera?.file)
+    if (camFile && existsSync(camFile)) {
       progress(0.6)
-      await fsp.copyFile(join(sib.dir, sib.camera.file), join(dir, `cam-${id}.mp4`))
-      camera = { file: `cam-${id}.mp4`, offset: sib.camera.offset }
+      await fsp.copyFile(camFile, join(dir, `cam-${id}.mp4`))
+      camera = { file: `cam-${id}.mp4`, offset: Number(sib.camera.offset) || 0 }
     }
   }
   progress(0.95)
@@ -946,12 +974,39 @@ app.whenReady().then(async () => {
   initTelemetry({ license: () => { const st = licenseStatus().state; return st === 'licensed' ? 'pro' : st } })
   startAutoUpdates()
   registerMediaProtocol()
-  session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(true))
-  session.defaultSession.setPermissionCheckHandler(() => true)
+  // camera, mic, screen etc. only for the app's own pages, never for a web page
+  session.defaultSession.setPermissionRequestHandler((wc, _perm, cb) => cb(isAppUrl(wc.getURL())))
+  session.defaultSession.setPermissionCheckHandler((wc) => !!wc && isAppUrl(wc.getURL()))
   createMainWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
   })
+})
+
+/** The app's own renderer: the bundled index.html (file://), or the dev server while developing. */
+function isAppUrl(u: string) {
+  try {
+    const url = new URL(u)
+    if (devUrl) return url.origin === new URL(devUrl).origin
+    return url.protocol === 'file:' && isInside(join(__dirname, '..'), fileURLToPath(url))
+  } catch {
+    return false
+  }
+}
+
+// Every window (incl. ones a page opens) gets the preload with the full `window.ilf` API, so
+// no window may ever show a remote page: links open in the browser, navigation stays in the app.
+app.on('web-contents-created', (_e, wc) => {
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^(https?|mailto):/i.test(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  wc.on('will-navigate', (e, url) => {
+    if (isAppUrl(url)) return
+    e.preventDefault()
+    if (/^(https?|mailto):/i.test(url)) shell.openExternal(url)
+  })
+  wc.on('will-attach-webview', (e) => e.preventDefault())
 })
 
 app.on('will-quit', () => globalShortcut.unregisterAll())

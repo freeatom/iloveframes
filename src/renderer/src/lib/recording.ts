@@ -24,10 +24,11 @@ function pickMime(cands: string[]) {
   return cands.find((m) => MediaRecorder.isTypeSupported(m)) ?? ''
 }
 
-function record(kind: string, stream: MediaStream, mime: string, bps: number) {
+/** `gate`: chunks are held until it resolves (the main process only takes them once the session exists). */
+function record(kind: string, stream: MediaStream, mime: string, bps: number, gate: Promise<unknown> = Promise.resolve()) {
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bps, audioBitsPerSecond: 192000 })
   const entry = { kind, rec, start: 0, done: Promise.resolve() }
-  let pending = Promise.resolve()
+  let pending: Promise<unknown> = gate.catch(() => {})
   rec.ondataavailable = (e) => {
     if (!e.data.size) return
     pending = pending.then(async () => window.ilf.rec.chunk(kind, await e.data.arrayBuffer()))
@@ -61,8 +62,25 @@ export async function startRecording(o: RecordOptions) {
   if (o.countdown > 0) {
     // countdown ticks are played by the countdown overlay
   } else playSfx('start', 0.8)
-  const res = await window.ilf.rec.prepare({ displayId: o.displayId, countdown: o.countdown, mode: o.mode, fps: o.fps, area: o.area ?? null })
+  // Camera and mic start *before* the screen capture: getting the capture going (hooks,
+  // ffmpeg's first frame, the control bar) takes up to a second or so, and anything said
+  // in that time used to be lost. The extra lead-in is trimmed off by its offset when the
+  // recording is packed, so the audio starts exactly with the screen.
+  let ready!: () => void
+  const gate = new Promise<void>((r) => (ready = r))
   const recorders: Active['recorders'] = []
+  if (cam) recorders.push(record('camera', cam, pickMime(['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']), 10_000_000, gate))
+  if (mic) recorders.push(record('mic', mic, pickMime(['audio/webm;codecs=opus', 'audio/webm']), 0, gate))
+  let res: Awaited<ReturnType<typeof window.ilf.rec.prepare>>
+  try {
+    res = await window.ilf.rec.prepare({ displayId: o.displayId, countdown: o.countdown, mode: o.mode, fps: o.fps, area: o.area ?? null })
+  } catch (err) {
+    for (const r of recorders) if (r.rec.state !== 'inactive') r.rec.stop()
+    streams.forEach((s) => s.getTracks().forEach((t) => t.stop()))
+    throw err
+  } finally {
+    ready()
+  }
   if (res.engine === 'browser' && res.sourceId) {
     const scr = await navigator.mediaDevices.getUserMedia({
       audio: false,
@@ -71,8 +89,6 @@ export async function startRecording(o: RecordOptions) {
     streams.push(scr)
     recorders.push(record('screen', scr, pickMime(['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']), 40_000_000))
   }
-  if (cam) recorders.push(record('camera', cam, pickMime(['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']), 10_000_000))
-  if (mic) recorders.push(record('mic', mic, pickMime(['audio/webm;codecs=opus', 'audio/webm']), 0))
   active = { recorders, streams, hasCamera: !!cam, hasMic: !!mic }
   return res
 }
