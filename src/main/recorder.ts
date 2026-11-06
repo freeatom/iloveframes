@@ -1,4 +1,4 @@
-import { app, screen, systemPreferences, Display, Rectangle } from 'electron'
+import { app, screen, Display, Rectangle } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { join } from 'path'
 import { LiveCapture, startLiveCapture, type CropFrac } from './ffmpeg'
@@ -20,6 +20,10 @@ export class InputTracker {
   private lastX = -1
   private lastY = -1
   ignoreRects: Rectangle[] = []
+  /** what the macOS helper said it can detect ('counter' | 'buttons' | 'none'), for diagnostics */
+  caps: { clicks: string; keys: string } | null = null
+  /** where input events come from on this platform */
+  source: 'hook' | 'helper' | 'none' = 'none'
 
   constructor(private display: Display) {}
 
@@ -46,9 +50,28 @@ export class InputTracker {
         const line = buf.slice(0, i).trim()
         buf = buf.slice(i + 1)
         if (line === 'arrow' || line === 'hand' || line === 'text') this.events.cursorTypes.push([Date.now(), line])
+        else if (line.startsWith('down ')) {
+          // macOS helper: "down <button> <agoMs>"
+          const [, b, ago] = line.split(' ')
+          this.addClick(Date.now() - Math.max(0, Math.min(500, +ago || 0)), +b || 1)
+        } else if (line.startsWith('key ')) {
+          const ago = +line.split(' ')[1] || 0
+          this.events.keys.push(Date.now() - Math.max(0, Math.min(500, ago)))
+        } else if (line.startsWith('caps ')) {
+          const [, clicks, keys] = line.split(' ')
+          this.caps = { clicks, keys }
+        }
       }
     })
     this.typeProc.on('error', () => {})
+  }
+
+  private addClick(t: number, button: number) {
+    const p = screen.getCursorScreenPoint()
+    if (this.ignoreRects.some((r) => p.x >= r.x && p.y >= r.y && p.x <= r.x + r.width && p.y <= r.y + r.height)) return
+    const [x, y] = this.norm(p)
+    if (x < 0 || y < 0 || x > 1 || y > 1) return
+    this.events.clicks.push([t, x, y, button])
   }
 
   start() {
@@ -65,27 +88,24 @@ export class InputTracker {
     sample()
     this.timer = setInterval(sample, 1000 / 120)
 
-    let canHook = true
-    if (process.platform === 'darwin') canHook = systemPreferences.isTrustedAccessibilityClient(false)
-    if (canHook) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { uIOhook } = require('uiohook-napi')
-        this.hook = uIOhook
-        uIOhook.removeAllListeners()
-        uIOhook.on('mousedown', (e: any) => {
-          const p = screen.getCursorScreenPoint()
-          if (this.ignoreRects.some((r) => p.x >= r.x && p.y >= r.y && p.x <= r.x + r.width && p.y <= r.y + r.height)) return
-          const [x, y] = this.norm(p)
-          if (x < 0 || y < 0 || x > 1 || y > 1) return
-          this.events.clicks.push([Date.now(), x, y, e.button ?? 1])
-        })
-        uIOhook.on('keydown', () => this.events.keys.push(Date.now()))
-        uIOhook.start()
-      } catch (err) {
-        console.warn('[iloveframes] global input hook unavailable', err)
-        this.hook = null
-      }
+    // macOS: clicks and keys come from the helper process above (no in-process hook:
+    // libuiohook's keyboard path can abort the whole app on recent macOS versions)
+    if (process.platform === 'darwin') {
+      this.source = this.typeProc ? 'helper' : 'none'
+      return
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { uIOhook } = require('uiohook-napi')
+      this.hook = uIOhook
+      uIOhook.removeAllListeners()
+      uIOhook.on('mousedown', (e: any) => this.addClick(Date.now(), e.button ?? 1))
+      uIOhook.on('keydown', () => this.events.keys.push(Date.now()))
+      uIOhook.start()
+      this.source = 'hook'
+    } catch (err) {
+      console.warn('[iloveframes] global input hook unavailable', err)
+      this.hook = null
     }
   }
 

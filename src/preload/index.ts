@@ -16,6 +16,9 @@ const api = {
   displayThumbs: (): Promise<Record<string, string>> => ipcRenderer.invoke('displays:thumbs'),
   permStatus: () => ipcRenderer.invoke('perm:status'),
   permRequest: (k: string) => ipcRenderer.invoke('perm:request', k),
+  permOpenSettings: (k: 'screen' | 'camera' | 'microphone') => ipcRenderer.invoke('perm:open-settings', k),
+  relaunch: () => ipcRenderer.invoke('app:relaunch'),
+  onProjectsChanged: (cb: () => void) => on('projects:changed', cb),
   rec: {
     prepare: (o: any) => ipcRenderer.invoke('rec:prepare', o),
     chunk: (kind: string, data: ArrayBuffer) => ipcRenderer.send('rec:chunk', kind, data),

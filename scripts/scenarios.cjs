@@ -963,3 +963,104 @@ module.exports.feedbackcheck = async (app, win, out) => {
   })
   console.log('FEEDBACK RESULT', JSON.stringify(r))
 }
+
+// bring-your-own-video project: two videos -> one project, a title, per-clip volume, export
+module.exports.vproj = async (app, win, out) => {
+  const { execFileSync } = require('child_process')
+  const ff = require('ffmpeg-static')
+  const fs = require('fs')
+  const dir = path.join(out, 'vproj-src')
+  fs.mkdirSync(dir, { recursive: true })
+  const a = path.join(dir, 'phone clip.mp4') // H.264/AAC: takes the lossless fast path
+  const b = path.join(dir, 'old camera.avi') // MPEG-4 part 2: gets converted
+  execFileSync(ff, ['-y', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30:duration=4', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', a])
+  execFileSync(ff, ['-y', '-f', 'lavfi', '-i', 'smptebars=size=960x540:rate=25:duration=3', '-c:v', 'mpeg4', '-q:v', '4', b])
+  const t0 = Date.now()
+  const id = await win.evaluate(([a, b]) => window.ilf.media.importAsProject([a, b]), [a, b])
+  console.log('IMPORT took', (Date.now() - t0) / 1000, 's, id', id)
+  await win.evaluate((id) => { location.hash = '/editor/' + encodeURIComponent(id) }, id)
+  await win.waitForTimeout(3500)
+  const p = await win.evaluate(async (id) => {
+    const p = await window.ilf.projects.load(id)
+    return { name: p.name, imported: p.imported, duration: p.duration, sources: (p.sources || []).map((s) => ({ name: s.name, duration: s.duration, w: s.width, h: s.height, audio: s.hasAudio })), screenAudio: p.screenAudio }
+  }, id)
+  console.log('PROJECT', JSON.stringify(p))
+  // add a title with T at 1s, then type into it
+  await win.evaluate(() => window.__ilfPlayer.seek(1))
+  await win.waitForTimeout(300)
+  await win.locator('body').click({ position: { x: 5, y: 300 } }).catch(() => {})
+  await win.keyboard.press('t')
+  await win.waitForTimeout(500)
+  const ta = win.locator('textarea').first()
+  await ta.fill('Hello from iloveframes')
+  await win.locator('body').click({ position: { x: 5, y: 300 } }).catch(() => {})
+  await win.evaluate(() => window.__ilfPlayer.seek(2))
+  await win.waitForTimeout(800)
+  await win.screenshot({ path: path.join(out, 'vproj-editor.png') })
+  await win.waitForTimeout(1200) // autosave
+  const saved = await win.evaluate(async (id) => {
+    const p = await window.ilf.projects.load(id)
+    return { clips: p.edit.clips.length, texts: p.edit.texts }
+  }, id)
+  console.log('SAVED', JSON.stringify(saved))
+  // export
+  await win.getByRole('button', { name: 'Export' }).first().click()
+  await win.waitForTimeout(500)
+  await win.getByRole('button', { name: /Export MP4/ }).click()
+  await win.getByText('Your video is ready').waitFor({ timeout: 180000 }).catch(async (e) => { await win.screenshot({ path: path.join(out, 'vproj-export-fail.png') }); throw e })
+  await win.screenshot({ path: path.join(out, 'vproj-done.png') })
+  const exported = fs.readdirSync(process.env.ILF_EXPORT_DIR).filter((f) => f.endsWith('.mp4')).map((f) => path.join(process.env.ILF_EXPORT_DIR, f)).sort((x, y) => fs.statSync(y).mtimeMs - fs.statSync(x).mtimeMs)[0]
+  console.log('EXPORTED', exported)
+  execFileSync(ff, ['-y', '-ss', '2', '-i', exported, '-frames:v', '1', path.join(out, 'vproj-frame-2s.png')])
+  execFileSync(ff, ['-y', '-ss', '5.5', '-i', exported, '-frames:v', '1', path.join(out, 'vproj-frame-5s.png')])
+  let probe = ''
+  try { execFileSync(ff, ['-i', exported]) } catch (e) { probe = String(e.stderr) }
+  console.log('PROBE', (probe.match(/Duration: [^,]+|Stream[^\n]+/g) || []).join(' | '))
+}
+
+// crash safety: start a real take, kill the app hard mid-recording (run `recovercheck` next)
+module.exports.crashrec = async (app, win, out) => {
+  await win.evaluate(() => { localStorage.setItem('ilf.countdown', '"0"'); localStorage.setItem('ilf.camOn', 'false'); localStorage.setItem('ilf.micEnabled', 'false'); localStorage.setItem('ilf.captureMode', '"full"'); location.reload() }).catch(() => {})
+  await win.waitForTimeout(3500)
+  await win.getByText('Start recording').click()
+  await win.waitForTimeout(6000)
+  console.log('KILLING app pid', app.process().pid)
+  require('child_process').execSync(`taskkill /F /PID ${app.process().pid}`)
+  await new Promise((r) => setTimeout(r, 1500))
+  process.exit(0)
+}
+module.exports.recovercheck = async (app, win, out) => {
+  await win.waitForTimeout(9000)
+  const list = await win.evaluate(() => window.ilf.projects.list())
+  const hit = list.find((p) => /\(recovered\)/.test(p.name))
+  console.log('RECOVERED', hit ? JSON.stringify({ name: hit.name, duration: hit.duration }) : 'none', 'of', list.length)
+  if (hit) {
+    const p = await win.evaluate((id) => window.ilf.projects.load(id), hit.id)
+    console.log('RECOVERED DETAIL', JSON.stringify({ file: p.screenFile, cursor: p.events.cursor.length, recovered: p.recovered }))
+  }
+  await win.screenshot({ path: path.join(out, 'recovered-home.png') })
+}
+
+// normal take, no mouse automation: record ~4 s, stop, land in the editor with a saved project
+module.exports.recordquick = async (app, win, out) => {
+  await win.evaluate(() => { localStorage.setItem('ilf.countdown', '"0"'); localStorage.setItem('ilf.camOn', 'false'); localStorage.setItem('ilf.micEnabled', 'false'); localStorage.setItem('ilf.captureMode', '"full"'); location.reload() }).catch(() => {})
+  await win.waitForTimeout(3500)
+  await win.screenshot({ path: path.join(out, 'home-110.png') })
+  await win.getByText('Start recording').click()
+  await win.waitForTimeout(4500)
+  await win.evaluate(() => window.ilf.rec.requestStop())
+  for (let i = 0; i < 60; i++) {
+    await win.waitForTimeout(1000)
+    if ((await win.evaluate(() => location.hash)).includes('editor')) break
+  }
+  await win.waitForTimeout(3000)
+  const info = await win.evaluate(async () => {
+    const id = decodeURIComponent(location.hash.split('/editor/')[1])
+    const p = await window.ilf.projects.load(id)
+    return { id, file: p.screenFile, duration: p.duration, cursor: p.events.cursor.length, engine: p.engine, texts: p.edit?.texts?.length }
+  })
+  console.log('PROJECT', JSON.stringify(info))
+  const fs = require('fs')
+  console.log('FILES', fs.readdirSync(info.id ? require('path').join(require('os').homedir(), 'Videos', 'iloveframes', info.id) : '.').join(','))
+  await win.screenshot({ path: path.join(out, 'editor-110.png') })
+}

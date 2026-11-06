@@ -23,7 +23,7 @@ export function sourceInfo(project: Project, id: string): SourceInfo | null {
   if (id === MAIN)
     return {
       id: MAIN,
-      name: 'Recording',
+      name: project.mainName || (project.imported ? 'Video' : 'Recording'),
       url: projectFile(project, project.screenFile ?? 'screen.mp4'),
       duration: project.duration,
       width: Math.round(project.display.width * project.display.scaleFactor),
@@ -215,6 +215,7 @@ export function rippleRemove(edit: EditState, a: number, b: number): EditState {
     ...edit,
     zoom: { ...edit.zoom, segments: edit.zoom.segments.map(span).filter(Boolean) as EditState['zoom']['segments'] },
     cursor: { ...edit.cursor, hidden: edit.cursor.hidden.map(span).filter(Boolean) as EditState['cursor']['hidden'] },
+    texts: (edit.texts ?? []).map(span).filter(Boolean) as EditState['texts'],
     audio: {
       ...edit.audio,
       clips: edit.audio.clips
@@ -232,6 +233,7 @@ export function rippleInsert(edit: EditState, at: number, d: number): EditState 
     ...edit,
     zoom: { ...edit.zoom, segments: edit.zoom.segments.map(span) },
     cursor: { ...edit.cursor, hidden: edit.cursor.hidden.map(span) },
+    texts: (edit.texts ?? []).map(span),
     audio: { ...edit.audio, clips: edit.audio.clips.map((c) => (c.start >= at ? { ...c, start: c.start + d } : c)) }
   }
 }

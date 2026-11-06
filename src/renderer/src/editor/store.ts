@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import type { EditState, MediaSource, Project, Transition, ZoomSegment } from '@/engine/types'
+import type { EditState, MediaSource, Project, TextOverlay, TextStyle, Transition, ZoomSegment } from '@/engine/types'
+import { makeText } from '@/engine/overlays'
 import { clipLen, rippleInsert, rippleRemove, seqDuration, seqStarts, splitClips } from '@/engine/sequence'
 import { uid } from '@/engine/types'
 import { track, trackOncePerSession } from '@/lib/telemetry'
@@ -140,6 +141,7 @@ export function removeSelected() {
   if (edit.clips.some((c) => c.id === selected)) deleteSeqClip(selected)
   else if (edit.zoom.segments.some((s) => s.id === selected)) removeSegment(selected)
   else if (edit.audio.clips.some((c) => c.id === selected)) removeClip(selected)
+  else if (edit.texts.some((t) => t.id === selected)) removeText(selected)
   else removeHide(selected)
 }
 
@@ -270,4 +272,42 @@ export function setTransition(clipId: string, t: Transition | null) {
 export function setAllTransitions(t: Transition | null) {
   if (t) track('transition_set', { kind: t.kind, all: true })
   updateEdit((e) => ({ ...e, clips: e.clips.map((c, i) => (i === 0 ? c : { ...c, tIn: t ?? undefined })) }))
+}
+
+// ---- text overlays ----
+/** Add a text overlay at T, squeezed into the free gap of the text lane. */
+export function addTextAt(t: number, style: TextStyle = 'title', len = 3) {
+  const { edit } = useEditor.getState()
+  if (!edit) return null
+  const total = seqDuration(edit.clips)
+  const o = makeText(style, t, total, len)
+  for (const r of edit.texts) {
+    if (r.start <= o.start && r.end > o.start) o.start = r.end + 0.05
+    if (r.start > o.start && r.start < o.end) o.end = r.start - 0.05
+  }
+  if (o.end - o.start < 0.4) {
+    // no room on the lane here: put it at the end of the video instead
+    const last = Math.max(0, ...edit.texts.map((r) => r.end))
+    if (total - last < 0.6) return null
+    o.start = last + 0.05
+    o.end = Math.min(total, o.start + len)
+  }
+  track('text_added', { style })
+  updateEdit((e) => ({ ...e, texts: [...e.texts, o].sort((a, b) => a.start - b.start) }))
+  useEditor.getState().select(o.id)
+  return o
+}
+
+export function patchText(id: string, patch: Partial<TextOverlay>, history = true) {
+  updateEdit((e) => ({ ...e, texts: e.texts.map((r) => (r.id === id ? { ...r, ...patch } : r)) }), history)
+}
+
+export function removeText(id: string) {
+  updateEdit((e) => ({ ...e, texts: e.texts.filter((r) => r.id !== id) }))
+  if (useEditor.getState().selected === id) useEditor.getState().select(null)
+}
+
+/** Loudness of a sequence clip's own sound. */
+export function setClipVolume(id: string, volume: number, history = true) {
+  updateEdit((e) => ({ ...e, clips: e.clips.map((c) => (c.id === id ? { ...c, volume } : c)) }), history)
 }

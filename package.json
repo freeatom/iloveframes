@@ -1,6 +1,6 @@
 {
   "name": "iloveframes",
-  "version": "1.0.7",
+  "version": "1.1.0",
   "description": "Beautiful product walkthrough recordings with smooth auto-zoom.",
   "main": "./out/main/index.js",
   "scripts": {

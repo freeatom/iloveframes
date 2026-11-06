@@ -1,12 +1,12 @@
 import {
   app, BrowserWindow, ipcMain, screen, desktopCapturer, protocol, dialog, shell,
-  systemPreferences, globalShortcut, session, Display, nativeImage, clipboard, net
+  systemPreferences, globalShortcut, session, Display, nativeImage, clipboard, net, Menu
 } from 'electron'
 import { join, extname, basename } from 'path'
 import { CONFIG } from './config'
 import { projectName } from '../shared/naming'
 import { checkForUpdates, installNow, startAutoUpdates, updateState } from './updater'
-import { promises as fsp, createReadStream, existsSync, statSync, mkdirSync } from 'fs'
+import { promises as fsp, createReadStream, existsSync, statSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs'
 import { Readable } from 'stream'
 import { randomUUID } from 'crypto'
 import { tmpdir } from 'os'
@@ -16,7 +16,10 @@ import { initLicense, status as licenseStatus, isUnlocked, activate as licenseAc
 import { importWallpapers, listWallpapers, removeWallpaper, importSounds, listSounds, removeSound, bundledWallpaperDir } from './library'
 import { appendRecData, readRecData, readSiblingProject, nextNumber, peekName, commitName, pad3 } from './ilfdata'
 import { initAgentBridge } from './agent'
-import { initTelemetry, setAway, track, trackOnce } from './telemetry'
+import { initTelemetry, setAway, track, trackOnce, flush as flushTelemetry } from './telemetry'
+const flushSoon = () => Promise.race([flushTelemetry({ timeoutMs: 2000 }), new Promise((r) => setTimeout(r, 2200))])
+
+const errMsg = (e: unknown) => String((e as Error)?.message ?? e).replace(/[A-Za-z]:\\[^\s'"]*|\/(Users|home|private|var)\/[^\s'"]*/g, '<path>').slice(0, 160)
 
 const isMac = process.platform === 'darwin'
 const devUrl = process.env['ELECTRON_RENDERER_URL']
@@ -59,7 +62,10 @@ function createMainWindow() {
       devTools: !app.isPackaged
     }
   })
-  mainWin.once('ready-to-show', () => mainWin?.show())
+  mainWin.once('ready-to-show', () => {
+    mainWin?.show()
+    if (process.env.ILF_SMOKE) smokeTest()
+  })
   mainWin.webContents.on('render-process-gone', (_e, d) => {
     console.error('[iloveframes] renderer gone', d.reason, d.exitCode)
     if (d.reason !== 'clean-exit') setTimeout(() => mainWin && loadRoute(mainWin, '/'), 500)
@@ -69,6 +75,33 @@ function createMainWindow() {
     controlWin?.close()
   })
   loadRoute(mainWin, '/')
+}
+
+/** CI check of a packaged build (ILF_SMOKE=1): the window opened; ffmpeg, capture devices and helpers are usable. */
+async function smokeTest() {
+  const out: Record<string, unknown> = { platform: process.platform, arch: process.arch, version: app.getVersion(), packaged: app.isPackaged }
+  try {
+    const v = await captureOutput(['-version'])
+    out.ffmpeg = /ffmpeg version (\S+)/.exec(v)?.[1] ?? null
+    if (isMac) {
+      out.screens = (await avfoundationScreensForSmoke()).length
+      out.videotoolbox = /h264_videotoolbox/.test(await captureOutput(['-hide_banner', '-encoders']))
+    }
+    const native = app.isPackaged ? join(process.resourcesPath, 'native') : join(app.getAppPath(), 'resources', 'native')
+    out.helper = existsSync(join(native, isMac ? 'cursor-mac.js' : 'cursor-win.ps1'))
+    out.wallpapers = existsSync(bundledWallpaperDir())
+    const ok = !!out.ffmpeg && !!out.helper
+    console.log((ok ? 'ILF_SMOKE_OK ' : 'ILF_SMOKE_FAIL ') + JSON.stringify(out))
+    clearRunMarker()
+    setTimeout(() => app.exit(ok ? 0 : 1), 300)
+  } catch (err) {
+    console.log('ILF_SMOKE_FAIL ' + String(err))
+    app.exit(1)
+  }
+}
+async function avfoundationScreensForSmoke() {
+  const { avfoundationScreens } = await import('./ffmpeg')
+  return (await avfoundationScreens()).filter((x) => x !== undefined)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +151,9 @@ interface Session {
   name: string
   /** recorded area as fractions of the display, or null for the full screen */
   area: CropFrac | null
+  fps: number
+  /** writes the tracking data to disk every few seconds so a crash can't lose it */
+  snapshot: NodeJS.Timeout | null
 }
 let rec: Session | null = null
 let areaWin: BrowserWindow | null = null
@@ -196,7 +232,9 @@ function openControlBar(display: Display, startWall: number) {
   })
   controlWin.setContentProtection(true)
   controlWin.setAlwaysOnTop(true, 'screen-saver')
-  controlWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  // macOS: skipTransformProcessType keeps the Dock icon and main window intact (without it
+  // Electron briefly turns the app into a background agent, which can leave the editor hidden)
+  controlWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
   loadRoute(controlWin, `/controlbar?start=${startWall}`)
   controlWin.once('ready-to-show', () => {
     controlWin?.showInactive()
@@ -211,6 +249,8 @@ async function beginStop() {
   rec.stopping = true
   rec.stopWall = Date.now()
   rec.tracker.stop()
+  if (rec.snapshot) clearInterval(rec.snapshot)
+  writeSnapshot(rec)
   globalShortcut.unregister('CommandOrControl+Shift+2')
   controlWin?.close()
   areaWin?.close()
@@ -223,6 +263,14 @@ async function beginStop() {
 ipcMain.handle('rec:prepare', async (_e, opts: { displayId: string; countdown: number; mode: 'auto' | 'manual'; fps: number; area?: { x: number; y: number; w: number; h: number } | null }) => {
   requireUnlocked()
   if (rec) throw new Error('Already recording')
+  if (isMac && systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
+    // ask once (shows the system prompt the first time), then explain the restart macOS needs
+    await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } }).catch(() => {})
+    if (systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
+      track('perm_missing', { kind: 'screen', at: 'record' })
+      throw new Error('MAC_SCREEN_PERMISSION')
+    }
+  }
   const display = displayFor(opts.displayId)
   const id = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '-' + randomUUID().slice(0, 4)
   const dir = join(projectsRoot(), id)
@@ -235,14 +283,16 @@ ipcMain.handle('rec:prepare', async (_e, opts: { displayId: string; countdown: n
 
   const tracker = new InputTracker(display)
   const area = toFrac(display, opts.area)
-  rec = { id, dir, display, tracker, capture: null, engine: 'native', mode: opts.mode, stopping: false, stopWall: 0, name, captureStopped: Promise.resolve(), area }
+  rec = { id, dir, display, tracker, capture: null, engine: 'native', mode: opts.mode, stopping: false, stopWall: 0, name, captureStopped: Promise.resolve(), area, fps: opts.fps || 60, snapshot: null }
   tracker.start()
+  markRun({ recording: id })
 
   let sourceId: string | null = null
   try {
     rec.capture = await startNativeCapture(display, dir, opts.fps || 60, area ?? undefined)
   } catch (err) {
     console.warn('[iloveframes] native capture failed, falling back to browser capture', err)
+    track('capture_fallback', { msg: errMsg(err).slice(-120) })
     rec.engine = 'browser'
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
     const src = sources.find((s) => s.display_id === String(display.id)) ?? sources[0]
@@ -252,9 +302,16 @@ ipcMain.handle('rec:prepare', async (_e, opts: { displayId: string; countdown: n
   openControlBar(display, startWall)
   if (area) showAreaOutline(display, area)
   globalShortcut.register('CommandOrControl+Shift+2', () => beginStop())
-  rec.capture?.exited.then(() => {
-    if (rec && !rec.stopping) beginStop() // capture died unexpectedly
+  rec.capture?.exited.then((code) => {
+    if (rec && !rec.stopping) {
+      track('capture_died', { code: code ?? -1, log: errMsg(rec.capture?.log().slice(-200) ?? '') })
+      beginStop() // capture died unexpectedly
+    }
   })
+  // keep a crash-safe copy of the session (the capture itself is written in fragments)
+  const r0 = rec
+  await fsp.writeFile(join(dir, 'rec.json'), JSON.stringify({ v: 1, id, name, mode: opts.mode, fps: r0.fps, engine: r0.engine, area, startedAt: Date.now() })).catch(() => {})
+  r0.snapshot = setInterval(() => writeSnapshot(r0), 4000)
   return { id, dir, engine: rec.engine, sourceId, startWall, display: { width: display.size.width, height: display.size.height, scaleFactor: display.scaleFactor } }
 })
 
@@ -313,48 +370,89 @@ ipcMain.on('rec:cancel', async () => {
   const r = rec
   r.stopping = true
   r.tracker.stop()
+  if (r.snapshot) clearInterval(r.snapshot)
   globalShortcut.unregister('CommandOrControl+Shift+2')
   controlWin?.close()
   areaWin?.close()
   r.capture?.kill()
   await r.capture?.exited
   rec = null
+  markRun({ recording: null })
   mainWin?.webContents.send('rec:cancelled')
-  mainWin?.show()
+  showMain()
   setTimeout(() => fsp.rm(r.dir, { recursive: true, force: true }).catch(() => {}), 1500)
 })
 
 ipcMain.handle('rec:finalize', async (_e, meta: { cameraStart?: number; micStart?: number; screenStart?: number; hasCamera: boolean; hasMic: boolean }) => {
   if (!rec) throw new Error('No recording')
   const r = rec
+  let stage = 'capture'
+  try {
+    return await finalizeRecording(r, meta, (st) => (stage = st))
+  } catch (err) {
+    track('recording_failed', { stage, msg: errMsg(err), engine: r.engine })
+    rec = null
+    markRun({ recording: null })
+    throw err
+  }
+})
+
+async function finalizeRecording(r: Session, meta: { cameraStart?: number; micStart?: number; screenStart?: number; hasCamera: boolean; hasMic: boolean }, setStage: (s: string) => void) {
   await Promise.all(writeChains.values())
   writeChains.clear()
   mainWin?.webContents.send('rec:processing', 'Finishing capture')
   await r.captureStopped
-  mainWin?.show()
+  showMain()
   const screenStart = r.engine === 'native' ? r.capture!.startWall() ?? r.stopWall : meta.screenStart ?? r.stopWall
 
   if (r.engine === 'browser') {
+    setStage('convert')
     mainWin?.webContents.send('rec:processing', 'Converting screen capture')
     await runFfmpeg(['-i', join(r.dir, 'screen.webm'), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-pix_fmt', 'yuv420p', '-vf', (r.area ? cropFilter(r.area) + ',' : '') + 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-g', '60', '-an', '-movflags', '+faststart', join(r.dir, 'screen.mp4')])
     await fsp.rm(join(r.dir, 'screen.webm'), { force: true })
   }
   if (meta.hasCamera && existsSync(join(r.dir, 'camera.webm'))) {
+    setStage('camera')
     mainWin?.webContents.send('rec:processing', 'Processing camera')
     await runFfmpeg(['-i', join(r.dir, 'camera.webm'), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-g', '10', '-an', '-movflags', '+faststart', join(r.dir, 'camera.mp4')])
   }
   if (meta.hasMic && existsSync(join(r.dir, 'mic.webm'))) {
+    setStage('mic')
     mainWin?.webContents.send('rec:processing', 'Processing audio')
     await runFfmpeg(['-i', join(r.dir, 'mic.webm'), '-vn', '-ac', '2', '-ar', '48000', '-c:a', 'pcm_s16le', join(r.dir, 'mic.wav')])
   }
   mainWin?.webContents.send('rec:processing', 'Generating preview')
   await runFfmpeg(['-ss', '0.5', '-i', join(r.dir, 'screen.mp4'), '-frames:v', '1', '-vf', 'scale=720:-2', '-q:v', '3', join(r.dir, 'thumb.jpg')]).catch(() => {})
 
+  setStage('pack')
   const rel = (t: number) => +((t - screenStart) / 1000).toFixed(4)
-  const ev = r.tracker.events
   const duration = +((r.stopWall - screenStart) / 1000).toFixed(3)
   const camera = meta.hasCamera && existsSync(join(r.dir, 'camera.mp4')) ? { file: 'camera.mp4', offset: rel(meta.cameraStart ?? screenStart) } : null
   const mic = meta.hasMic && existsSync(join(r.dir, 'mic.wav')) ? { file: 'mic.wav', offset: rel(meta.micStart ?? screenStart) } : null
+  const project = await assembleProject({ ...r, events: r.tracker.events }, screenStart, duration, camera, mic)
+  for (const f of ['camera.webm', 'mic.webm', 'rec.json', 'events.json']) await fsp.rm(join(r.dir, f), { force: true }).catch(() => {})
+  rec = null
+  markRun({ recording: null })
+  const ev = r.tracker.events
+  track('recording_finished', {
+    dur: duration, camera: !!camera, mic: !!mic, area: !!r.area, engine: r.engine, mode: r.mode,
+    clicks: ev.clicks.length, keys: ev.keys.length, shapes: ev.cursorTypes.length, input: r.tracker.source,
+    ...(r.tracker.caps ? { capClicks: r.tracker.caps.clicks, capKeys: r.tracker.caps.keys } : {})
+  })
+  return { ...project, dir: r.dir }
+}
+
+/** Raw wall-clock events -> the saved project (shared by a normal stop and crash recovery). */
+async function assembleProject(
+  r: { id: string; dir: string; name: string; mode: 'auto' | 'manual'; engine: 'native' | 'browser'; area: CropFrac | null; display: { size: { width: number; height: number }; scaleFactor: number }; events: InputTracker['events'] },
+  screenStart: number,
+  duration: number,
+  camera: { file: string; offset: number } | null,
+  mic: { file: string; offset: number } | null,
+  extra: Record<string, unknown> = {}
+) {
+  const rel = (t: number) => +((t - screenStart) / 1000).toFixed(4)
+  const ev = r.events
   // with an area, positions are re-expressed inside that area (0..1 = its edges), so
   // smart zoom and the cinematic cursor work exactly as for a full-screen take
   const A = r.area ?? { x: 0, y: 0, w: 1, h: 1 }
@@ -400,12 +498,122 @@ ipcMain.handle('rec:finalize', async (_e, meta: { cameraStart?: number; micStart
     events,
     edit: null
   }
+  Object.assign(project, extra)
   await fsp.writeFile(join(r.dir, 'project.json'), JSON.stringify(project))
-  for (const f of ['camera.webm', 'mic.webm']) await fsp.rm(join(r.dir, f), { force: true }).catch(() => {})
-  rec = null
-  track('recording_finished', { dur: duration, camera: !!camera, mic: !!mic, area: !!r.area, engine: r.engine, mode: r.mode })
-  return { ...project, dir: r.dir }
-})
+  return project
+}
+
+/** Bring the main window back after a recording (on macOS also the Dock icon and focus). */
+function showMain() {
+  if (!mainWin) return
+  if (isMac) app.dock?.show().catch?.(() => {})
+  mainWin.show()
+  mainWin.focus()
+  if (isMac) app.focus({ steal: true })
+}
+
+/** Tracking data so far, written next to the capture so a crash can't lose it. */
+function writeSnapshot(r: Session) {
+  try {
+    const start = r.capture?.startWall() ?? null
+    writeFileSync(join(r.dir, 'events.json'), JSON.stringify({ screenStart: start, stopWall: r.stopWall || Date.now(), display: { size: r.display.size, scaleFactor: r.display.scaleFactor }, events: r.tracker.events }))
+  } catch {}
+}
+
+/**
+ * A recording that never finished (the app crashed, was force-quit, or the Mac
+ * restarted) still has its capture on disk: the screen is written in fragments,
+ * so everything up to the last second or so plays. Turn those into projects.
+ */
+let recovering = false
+async function recoverRecordings() {
+  if (recovering) return
+  recovering = true
+  try {
+    await recoverAll()
+  } finally {
+    recovering = false
+  }
+}
+async function recoverAll() {
+  const root = projectsRoot()
+  console.log('[iloveframes] checking for unfinished recordings')
+  for (const id of await fsp.readdir(root).catch(() => [] as string[])) {
+    const dir = join(root, id)
+    if (!existsSync(join(dir, 'rec.json')) || existsSync(join(dir, 'project.json'))) continue
+    if (rec?.id === id) continue
+    try {
+      // a hard crash can leave the screen capture running on its own: stop it first
+      await killOrphanCapture(id)
+      const meta = JSON.parse(await fsp.readFile(join(dir, 'rec.json'), 'utf8'))
+      const snap = existsSync(join(dir, 'events.json')) ? JSON.parse(await fsp.readFile(join(dir, 'events.json'), 'utf8')) : null
+      const screen = join(dir, 'screen.mp4')
+      const size = existsSync(screen) ? statSync(screen).size : 0
+      if (size < 50_000 || meta.engine !== 'native') {
+        track('recording_lost', { size: Math.round(size / 1024), engine: meta.engine ?? '' })
+        await fsp.rm(dir, { recursive: true, force: true })
+        continue
+      }
+      const info = await probeMedia(screen)
+      if (!info.duration) {
+        track('recording_lost', { size: Math.round(size / 1024), why: 'unreadable' })
+        await fsp.rename(join(dir, 'rec.json'), join(dir, 'rec.failed.json')).catch(() => {})
+        continue
+      }
+      await runFfmpeg(['-ss', String(Math.min(0.5, info.duration / 2)), '-i', screen, '-frames:v', '1', '-vf', 'scale=720:-2', '-q:v', '3', join(dir, 'thumb.jpg')]).catch(() => {})
+      const events = snap?.events ?? { cursor: [], cursorTypes: [], clicks: [], keys: [] }
+      const screenStart = snap?.screenStart ?? events.cursor[0]?.[0] ?? Date.now()
+      const display = snap?.display ?? { size: { width: info.width, height: info.height }, scaleFactor: 1 }
+      const duration = +info.duration.toFixed(3)
+      await assembleProject(
+        { id: meta.id ?? id, dir, name: String(meta.name ?? projectName(id)).replace(/^([^·]*?)(\s·|$)/, '$1 (recovered)$2'), mode: meta.mode === 'manual' ? 'manual' : 'auto', engine: 'native', area: meta.area ?? null, display, events },
+        screenStart, duration, null, null, { recovered: true }
+      )
+      await fsp.rm(join(dir, 'rec.json'), { force: true }).catch(() => {})
+      await fsp.rm(join(dir, 'events.json'), { force: true }).catch(() => {})
+      track('recording_recovered', { dur: Math.round(duration), clicks: events.clicks.length })
+      mainWin?.webContents.send('projects:changed')
+    } catch (err) {
+      console.warn('[iloveframes] could not recover a recording', id, err)
+      track('recording_lost', { why: errMsg(err) })
+      await fsp.rename(join(dir, 'rec.json'), join(dir, 'rec.failed.json')).catch(() => {})
+    }
+  }
+}
+
+/** Stop an ffmpeg capture still writing into a session folder after the app that started it died. */
+async function killOrphanCapture(sessionId: string) {
+  if (!/^[\w-]+$/.test(sessionId)) return
+  const { execFile } = await import('child_process')
+  const run = (cmd: string, args: string[]) => new Promise<void>((r) => execFile(cmd, args, { windowsHide: true, timeout: 8000 }, () => r()))
+  if (process.platform === 'win32')
+    await run('powershell.exe', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" | Where-Object { $_.CommandLine -like '*${sessionId}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`])
+  else await run('pkill', ['-f', sessionId])
+  await new Promise((r) => setTimeout(r, 400))
+}
+
+// ---------------------------------------------------------------------------
+// Run marker: tells the next launch whether this one ended cleanly
+// ---------------------------------------------------------------------------
+const runFile = () => join(app.getPath('userData'), 'run.json')
+let runState: { pid: number; version: string; startedAt: number; recording: string | null } | null = null
+function markRun(patch: Partial<NonNullable<typeof runState>>) {
+  if (!runState) return
+  Object.assign(runState, patch)
+  try {
+    writeFileSync(runFile(), JSON.stringify(runState))
+  } catch {}
+}
+function checkLastRun() {
+  try {
+    if (existsSync(runFile())) {
+      const last = JSON.parse(readFileSync(runFile(), 'utf8'))
+      track('unclean_exit', { v: String(last.version ?? ''), recording: !!last.recording, upMin: Math.round((Date.now() - (last.startedAt ?? Date.now())) / 60000) })
+    }
+  } catch {}
+  runState = { pid: process.pid, version: app.getVersion(), startedAt: Date.now(), recording: null }
+  markRun({})
+}
 
 /** Audio filter that lines a separately recorded track up with the screen (starts at 0). */
 const alignAudio = (input: number, offset: number, duration: number) =>
@@ -574,8 +782,22 @@ ipcMain.handle('perm:status', async () => {
     screen: systemPreferences.getMediaAccessStatus('screen'),
     camera: systemPreferences.getMediaAccessStatus('camera'),
     microphone: systemPreferences.getMediaAccessStatus('microphone'),
-    accessibility: systemPreferences.isTrustedAccessibilityClient(false)
+    // clicks and keys are read without Accessibility access now, so it is never required
+    accessibility: true
   }
+})
+ipcMain.handle('app:relaunch', () => {
+  track('app_relaunch')
+  flushSoon().finally(() => {
+    clearRunMarker()
+    app.relaunch()
+    app.exit(0)
+  })
+})
+ipcMain.handle('perm:open-settings', (_e, kind: 'screen' | 'camera' | 'microphone') => {
+  if (!isMac) return
+  const pane = kind === 'camera' ? 'Privacy_Camera' : kind === 'microphone' ? 'Privacy_Microphone' : 'Privacy_ScreenCapture'
+  return shell.openExternal('x-apple.systempreferences:com.apple.preference.security?' + pane)
 })
 
 ipcMain.handle('perm:request', async (_e, kind: 'camera' | 'microphone' | 'accessibility' | 'screen') => {
@@ -622,12 +844,18 @@ const VIDEO_EXT = ['mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi']
 async function probeMedia(file: string) {
   const out = await captureOutput(['-i', file])
   const d = /Duration: (\d+):(\d+):(\d+(?:\.\d+)?)/.exec(out)
-  const v = /Stream[^\n]*Video:[^\n]*?(\d{2,5})x(\d{2,5})/.exec(out)
+  const vline = /Stream[^\n]*Video:[^\n]*/.exec(out)?.[0] ?? ''
+  const v = /(\d{2,5})x(\d{2,5})/.exec(vline.replace(/\b0x[0-9a-f]+/gi, ''))
+  const aline = /Stream[^\n]*Audio:[^\n]*/.exec(out)?.[0] ?? ''
   return {
     duration: d ? +d[1] * 3600 + +d[2] * 60 + +d[3] : 0,
     width: v ? +v[1] : 0,
     height: v ? +v[2] : 0,
-    hasAudio: /Stream[^\n]*Audio:/.test(out)
+    hasAudio: !!aline,
+    /** H.264 8-bit 4:2:0 video, AAC (or no) audio and no rotation: usable as is, no re-encode */
+    copyable:
+      /Video: h264/.test(vline) && /yuv420p(?!10)/.test(vline) && (!aline || /Audio: aac/.test(aline)) &&
+      !/rotate\s*:\s*-?[1-9]|rotation of -?[1-9]/i.test(out)
   }
 }
 
@@ -635,12 +863,29 @@ async function probeMedia(file: string) {
 async function transcodeVideo(input: string, output: string, label: string) {
   const info = await probeMedia(input)
   if (!info.duration || !info.width) throw new Error(`Couldn't read video: ${basename(input)}`)
+  // already H.264/AAC (most phone, screen and web videos): repackage losslessly in a second or two
+  if (info.copyable && info.width % 2 === 0 && info.height % 2 === 0) {
+    try {
+      mainWin?.webContents.send('media:progress', { label, p: 0.3 })
+      await runFfmpeg(['-i', input, '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', '-movflags', '+faststart', output])
+      const res = await probeMedia(output)
+      if (res.duration > 0 && res.width > 0) {
+        track('video_imported', { fast: true, s: Math.round(info.duration), h: info.height })
+        return { ...res, duration: res.duration || info.duration }
+      }
+    } catch (err) {
+      console.warn('[iloveframes] fast import failed, converting instead', err)
+    }
+    await fsp.rm(output, { force: true }).catch(() => {})
+  }
+  const t0 = Date.now()
   await runFfmpeg(
     ['-i', input, '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
       '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-g', '30', '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000', '-movflags', '+faststart', output],
     (sec) => mainWin?.webContents.send('media:progress', { label, p: Math.min(1, sec / info.duration) })
   )
   const res = await probeMedia(output)
+  track('video_imported', { fast: false, s: Math.round(info.duration), h: info.height, ms: Date.now() - t0 })
   return { ...res, duration: res.duration || info.duration }
 }
 
@@ -768,15 +1013,17 @@ ipcMain.handle('recordings:list', async (_e, exceptId?: string) => {
 
 ipcMain.handle('project:import-video', async (_e, paths?: string[]) => {
   requireUnlocked()
-  const p = (paths ?? (await pickVideos(false)))[0]
+  const all = (paths ?? (await pickVideos(true))).filter((x) => VIDEO_EXT.includes(extname(x).slice(1).toLowerCase())).slice(0, 40)
+  const p = all[0]
   if (!p) return null
   const id = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '-' + randomUUID().slice(0, 4)
   const dir = join(projectsRoot(), id)
   await fsp.mkdir(dir, { recursive: true })
   try {
     const name = basename(p, extname(p))
+    const firstLabel = all.length > 1 ? `${name} (1 of ${all.length})` : name
     // an iloveframes recording opens as a full project, tracking data included
-    const rec = await importRecording(p, dir, 'main', name)
+    const rec = await importRecording(p, dir, 'main', firstLabel)
     let project: any
     if (rec) {
       await fsp.rename(join(dir, rec.file), join(dir, 'screen.mp4'))
@@ -787,13 +1034,34 @@ ipcMain.handle('project:import-video', async (_e, paths?: string[]) => {
         camera: rec.camera ? { file: 'camera.mp4', offset: rec.camera.offset } : null, mic: null, events: rec.track.events, edit: null, sources: []
       }
     } else {
-      const info = await transcodeVideo(p, join(dir, 'screen.mp4'), name)
+      const info = await transcodeVideo(p, join(dir, 'screen.mp4'), firstLabel)
       project = {
         id, name, createdAt: Date.now(), mode: 'manual', engine: 'import', cursorBaked: true, screenAudio: info.hasAudio,
         display: { width: info.width, height: info.height, scaleFactor: 1 },
         duration: info.duration, camera: null, mic: null, events: { cursor: [], cursorTypes: [], clicks: [], keys: [] }, edit: null, sources: []
       }
     }
+    project.imported = !rec || all.length > 1
+    if (project.imported) project.mainName = name
+    // the rest of the videos come along as clips, in the order they were picked
+    if (all.length > 1) {
+      project.name = `${name} + ${all.length - 1} more`
+      for (let i = 1; i < all.length; i++) {
+        const q = all[i]
+        const sid = randomUUID().slice(0, 8)
+        const base = basename(q, extname(q))
+        const label = `${base} (${i + 1} of ${all.length})`
+        try {
+          const r2 = await importRecording(q, dir, sid, label)
+          if (r2) project.sources.push({ id: sid, name: base, ...r2 })
+          else project.sources.push({ id: sid, name: base, file: `src-${sid}.mp4`, ...(await transcodeVideo(q, join(dir, `src-${sid}.mp4`), label)) })
+        } catch (err) {
+          console.warn('[iloveframes] skipped a video that could not be read', err)
+          track('video_import_failed', { msg: String((err as Error)?.message ?? err).slice(0, 100) })
+        }
+      }
+    }
+    track('video_project_created', { videos: all.length, recordings: rec ? 1 : 0 })
     await runFfmpeg(['-ss', String(Math.min(0.5, project.duration / 2)), '-i', join(dir, 'screen.mp4'), '-frames:v', '1', '-vf', 'scale=720:-2', '-q:v', '3', join(dir, 'thumb.jpg')]).catch(() => {})
     await fsp.writeFile(join(dir, 'project.json'), JSON.stringify(project))
     return id
@@ -940,10 +1208,64 @@ function requireUnlocked() {
   if (!isUnlocked()) throw new Error(LOCKED)
 }
 
+/** macOS: a proper app menu (About, updates, Edit shortcuts for text fields, Window, Help). */
+function buildMacMenu() {
+  if (!isMac) return
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: app.name,
+        submenu: [
+          { role: 'about' },
+          { label: 'Check for Updates…', click: () => checkForUpdates(true) },
+          { type: 'separator' },
+          { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+          { type: 'separator' },
+          { role: 'quit' }
+        ]
+      },
+      { role: 'editMenu' },
+      { label: 'View', submenu: [{ role: 'togglefullscreen' }, ...(app.isPackaged ? [] : [{ role: 'reload' as const }, { role: 'toggleDevTools' as const }])] },
+      { role: 'windowMenu' },
+      {
+        role: 'help',
+        submenu: [
+          { label: 'iloveframes Website', click: () => shell.openExternal('https://iloveframes.app') },
+          { label: 'Email Support', click: () => shell.openExternal('mailto:support@iloveframes.app') }
+        ]
+      }
+    ])
+  )
+}
+
+/** macOS: running from the disk image or Downloads breaks updates and permissions, so offer the move. */
+async function offerMoveToApplications() {
+  if (!isMac || !app.isPackaged || process.env.ILF_NO_MOVE) return
+  try {
+    if (app.isInApplicationsFolder()) return
+    const r = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Move to Applications', 'Not now'],
+      defaultId: 0,
+      cancelId: 1,
+      message: 'Move iloveframes to your Applications folder?',
+      detail: 'Running it from the disk image or Downloads stops updates from installing and makes macOS forget your Screen Recording permission.'
+    })
+    track('mac_move_offered', { accepted: r.response === 0 })
+    if (r.response === 0) app.moveToApplicationsFolder()
+  } catch (err) {
+    track('mac_move_failed', { msg: errMsg(err) })
+  }
+}
+
 app.whenReady().then(async () => {
+  await offerMoveToApplications()
+  buildMacMenu()
   initAgentBridge({ window: () => mainWin, listProjects })
   await initLicense()
   initTelemetry({ license: () => { const st = licenseStatus().state; return st === 'licensed' ? 'pro' : st } })
+  checkLastRun()
+  if (isMac) track('mac_perms', { screen: systemPreferences.getMediaAccessStatus('screen'), translocated: /AppTranslocation/.test(process.execPath) })
   startAutoUpdates()
   registerMediaProtocol()
   session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(true))
@@ -951,10 +1273,23 @@ app.whenReady().then(async () => {
   createMainWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
+    else if (mainWin && !rec) showMain()
   })
+  setTimeout(() => recoverRecordings().catch(() => {}), 2500)
 })
 
-app.on('will-quit', () => globalShortcut.unregisterAll())
+/** This run ended on purpose (quit, restart, update): the next launch shouldn't count it as a crash. */
+function clearRunMarker() {
+  try {
+    if (runState) rmSync(runFile(), { force: true })
+  } catch {}
+}
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+  clearRunMarker()
+})
+// app.exit() (restart, Mac update swap) skips will-quit; a real crash never gets here
+process.on('exit', clearRunMarker)
 app.on('window-all-closed', () => {
   if (rec) rec.capture?.kill()
   if (!isMac) app.quit()

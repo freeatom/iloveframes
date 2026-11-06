@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { AudioLines, EyeOff, Film, MousePointerClick, Plus, ZoomIn } from 'lucide-react'
-import { addClipAt, addHideAt, addSegmentAt, appendSources, moveSeqClip, patchClip, patchHide, patchSegment, trimSeqClip, useEditor, updateEdit } from './store'
+import { AudioLines, EyeOff, Film, MousePointerClick, Plus, Type, ZoomIn } from 'lucide-react'
+import { addClipAt, addHideAt, addSegmentAt, addTextAt, appendSources, moveSeqClip, patchClip, patchHide, patchSegment, patchText, trimSeqClip, useEditor, updateEdit } from './store'
 import { player } from './Preview'
 import { mediaUrl, type EditState, type SeqClip } from '@/engine/types'
 import { clipLen, seqDuration, seqEvents, seqStarts, sourceInfo, transitionHalf, type SourceInfo } from '@/engine/sequence'
@@ -10,6 +10,8 @@ import { transitionFor } from '@/engine/motion'
 import { Tip } from '@/components/ui/tooltip'
 
 const TRACK_X = 76 // left gutter for labels
+/** vertical spot of each lane (px from the top of the timeline) */
+const L = { zoom: { top: 102, h: 34 }, hide: { top: 142, h: 28 }, text: { top: 176, h: 30 }, audio: { top: 212, h: 34 } }
 
 const THUMBS_PER_SOURCE = 48
 const thumbCache = new Map<string, { list: string[]; listeners: Set<() => void>; started: boolean }>()
@@ -82,7 +84,7 @@ function ClipBlock({ clip, src, x, w, pps, selected, onDown, onEdge, label, show
   )
 }
 
-type Lane = 'zoom' | 'hide'
+type Lane = 'zoom' | 'hide' | 'text'
 type Span = { id: string; start: number; end: number }
 
 type Drag =
@@ -193,9 +195,9 @@ export function Timeline() {
       }
       else if ('lane' in d) {
         const ed = useEditor.getState().edit!
-        const segs: Span[] = d.lane === 'zoom' ? ed.zoom.segments : ed.cursor.hidden
-        const patch = d.lane === 'zoom' ? patchSegment : patchHide
-        const minLen = d.lane === 'zoom' ? 0.6 : 0.3
+        const segs: Span[] = d.lane === 'zoom' ? ed.zoom.segments : d.lane === 'hide' ? ed.cursor.hidden : ed.texts
+        const patch = d.lane === 'zoom' ? patchSegment : d.lane === 'hide' ? patchHide : patchText
+        const minLen = d.lane === 'zoom' ? 0.6 : d.lane === 'hide' ? 0.3 : 0.4
         const s = segs.find((x) => x.id === d.id)
         if (!s) return
         const others = segs.filter((x) => x.id !== d.id)
@@ -374,11 +376,18 @@ export function Timeline() {
           </div>
 
           {/* labels */}
-          <div className="absolute left-0 top-7 z-20 flex w-[68px] flex-col gap-2 pl-3 pt-3">
-            <div className="flex h-14 items-center gap-1.5 text-[11px] font-medium text-zinc-500"><Film className="h-3.5 w-3.5" /> Clip</div>
-            <div className="flex h-10 items-center gap-1.5 text-[11px] font-medium text-zinc-500"><ZoomIn className="h-3.5 w-3.5" /> Zoom</div>
-            <div className="flex h-8 items-center gap-1.5 text-[11px] font-medium text-zinc-500"><EyeOff className="h-3.5 w-3.5" /> Cursor</div>
-            <div className="mt-1 flex h-8 items-center gap-1.5 text-[11px] font-medium text-zinc-500"><AudioLines className="h-3.5 w-3.5" /> Audio</div>
+          <div className="pointer-events-none absolute left-0 top-0 z-20 w-[68px] pl-3 text-[11px] font-medium text-zinc-500">
+            {[
+              { top: 40, h: 56, icon: Film, label: 'Clip' },
+              { top: L.zoom.top, h: L.zoom.h, icon: ZoomIn, label: 'Zoom' },
+              { top: L.hide.top, h: L.hide.h, icon: EyeOff, label: 'Cursor' },
+              { top: L.text.top, h: L.text.h, icon: Type, label: 'Text' },
+              { top: L.audio.top, h: L.audio.h, icon: AudioLines, label: 'Audio' }
+            ].map((r) => (
+              <div key={r.label} className="absolute flex items-center gap-1.5" style={{ top: r.top, height: r.h }}>
+                <r.icon className="h-3.5 w-3.5" /> {r.label}
+              </div>
+            ))}
           </div>
 
           {/* sequence: clips back to back (the anchor lets the walkthrough point at the whole row) */}
@@ -438,8 +447,8 @@ export function Timeline() {
           {/* zoom lane */}
           {renderLane({
             lane: 'zoom',
-            top: 104,
-            height: 40,
+            top: L.zoom.top,
+            height: L.zoom.h,
             items: edit.zoom.segments,
             hint: 'double-click to add zoom',
             onAdd: addSegmentAt,
@@ -471,8 +480,8 @@ export function Timeline() {
           {/* cursor-hide lane */}
           {renderLane({
             lane: 'hide',
-            top: 152,
-            height: 32,
+            top: L.hide.top,
+            height: L.hide.h,
             items: edit.cursor.hidden,
             hint: 'double-click to hide cursor here',
             onAdd: addHideAt,
@@ -488,11 +497,31 @@ export function Timeline() {
             )
           })}
 
+          {/* text lane: titles, captions, lower thirds */}
+          {renderLane({
+            lane: 'text',
+            top: L.text.top,
+            height: L.text.h,
+            items: edit.texts,
+            hint: 'double-click to add text (T)',
+            onAdd: (t) => addTextAt(t, 'title'),
+            minW: 44,
+            style: (sel) =>
+              sel
+                ? 'border-white/70 bg-amber-400/85 text-black shadow-[0_0_0_3px_rgba(251,191,36,.28)]'
+                : 'border-white/10 bg-amber-400/30 text-amber-50 hover:bg-amber-400/45',
+            label: (sp) => (
+              <>
+                <Type className="h-3 w-3 shrink-0" /> <span className="truncate">{(sp as (typeof edit.texts)[number]).text.split(/\r?\n/)[0] || 'Text'}</span>
+              </>
+            )
+          })}
+
           {/* audio lane: drop sounds here */}
           <div
             data-tour="lane-audio"
             className={cn('absolute rounded-xl ring-1 transition-colors', dropT !== null ? 'bg-brand-rose/[0.08] ring-brand-rose/50' : 'bg-white/[0.02] ring-white/[0.05]')}
-            style={{ left: xOf(0), width: inner, top: 192, height: 34 }}
+            style={{ left: xOf(0), width: inner, top: L.audio.top, height: L.audio.h }}
             onPointerDown={(e) => {
               if (e.target === e.currentTarget) useEditor.getState().select(null)
             }}
@@ -532,7 +561,7 @@ export function Timeline() {
       </div>
       <div className="flex h-8 shrink-0 items-center gap-3 border-t border-white/[0.04] px-4 text-[10.5px] text-zinc-600">
         <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-brand-rose" /> clicks</span>
-        <span>Drag edges to trim · drag a clip to reorder · S splits · click the round button on a cut for transitions · double-click a lane to add · {navigator.userAgent.includes('Mac') ? '⌘' : 'Ctrl'}+scroll to zoom timeline</span>
+        <span className="min-w-0 truncate">Drag edges to trim · drag clips to reorder · S split · T text · double-click a lane to add · round button on a cut for transitions · {navigator.userAgent.includes('Mac') ? '⌘' : 'Ctrl'}+scroll to zoom</span>
         <div className="flex-1" />
         <input type="range" min={1} max={20} step={0.1} value={zoom} onChange={(e) => setZoom(+e.target.value)} className="w-28 accent-brand-orchid" />
       </div>

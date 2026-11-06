@@ -11,12 +11,12 @@ import { LogoMark } from './Brand'
  * data-tour="…"; steps whose element isn't on screen are skipped, so the tour
  * never points at nothing. Esc skips, the arrow keys move between cards.
  */
-export type PanelTour = 'tab-clips' | 'tab-background' | 'tab-frame' | 'tab-cursor' | 'tab-zoom' | 'tab-camera' | 'tab-audio'
+export type PanelTour = 'tab-clips' | 'tab-background' | 'tab-frame' | 'tab-cursor' | 'tab-zoom' | 'tab-text' | 'tab-camera' | 'tab-audio'
 export type TourName = 'home' | 'editor' | PanelTour
 interface Step {
   target?: string
   /** editor tab to open while this card is showing */
-  tab?: 'clips' | 'background' | 'frame' | 'cursor' | 'zoom' | 'camera' | 'audio'
+  tab?: 'clips' | 'background' | 'frame' | 'cursor' | 'zoom' | 'text' | 'camera' | 'audio'
   title: string
   body: React.ReactNode
 }
@@ -28,6 +28,7 @@ export const TOURS: Record<TourName, Step[]> = {
     { target: 'devices', title: 'Camera & mic', body: 'Add a selfie bubble or a voice-over. Both stay off until you switch them on.' },
     { target: 'mode', title: 'Automatic or manual', body: 'Automatic zooms in on your clicks and typing for you. Manual starts clean.' },
     { target: 'record', title: 'Hit record', body: <>Talk it through like you would on a call. Stop with <kbd className="tour-kbd">{modKey}</kbd> <kbd className="tour-kbd">Shift</kbd> <kbd className="tour-kbd">2</kbd> or the floating bar.</> },
+    { target: 'video-project', title: 'Edit your own videos', body: 'Start a project from videos you already have, or drop them anywhere on this window. Trim, add text, music and transitions.' },
     { target: 'recent', title: 'Your projects', body: 'Every recording lands here, ready to edit and export.' },
     { target: 'account', title: 'Account & help', body: 'Your license lives here, and the ? button replays this tour whenever you like.' }
   ],
@@ -72,6 +73,9 @@ export const TOURS: Record<TourName, Step[]> = {
     { target: 'zoom-main', title: 'Smart zoom', body: 'Zooms are placed on your clicks and typing. Regenerate them any time after edits.' },
     { target: 'zoom-motion', title: 'How it moves', body: 'Choose slow, normal or snappy ease, and how closely the camera follows the cursor.' },
     { target: 'zoom-list', title: 'Every zoom', body: 'Click one to jump to it. Each can follow the cursor or lock on a fixed point.' }
+  ],
+  'tab-text': [
+    { target: 'text-add', title: 'Titles and captions', body: 'Pick a style to drop it at the playhead. Change the words, spot, colour and animation on the right, and its timing on the Text lane.' }
   ],
   'tab-camera': [
     { target: 'camera-main', title: 'Your webcam bubble', body: 'Pick a shape, corner and size. It shrinks politely while the screen zooms in.' }

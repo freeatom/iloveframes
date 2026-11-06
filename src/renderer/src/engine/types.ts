@@ -78,6 +78,29 @@ export interface SeqClip {
   out: number
   /** transition from the previous clip into this one */
   tIn?: Transition
+  /** loudness of this clip's own sound (0..2, default 1) */
+  volume?: number
+}
+
+export type TextStyle = 'title' | 'subtitle' | 'caption' | 'lower' | 'badge'
+export type TextAnim = 'fade' | 'rise' | 'pop' | 'type' | 'none'
+export type TextBg = 'none' | 'shadow' | 'pill' | 'box'
+
+/** A text overlay (title, caption, lower third...) placed on the timeline. */
+export interface TextOverlay {
+  id: string
+  start: number
+  end: number
+  text: string
+  style: TextStyle
+  /** anchor position as fractions of the output frame */
+  x: number
+  y: number
+  /** size multiplier on the style's base size */
+  size: number
+  color: string
+  bg: TextBg
+  anim: TextAnim
 }
 
 export interface EditState {
@@ -124,6 +147,8 @@ export interface EditState {
   clips: SeqClip[]
   /** non-destructive crop per source (fractions of the source frame); missing = whole frame */
   crops?: Record<string, CropRect>
+  /** titles, captions and labels drawn over the video */
+  texts: TextOverlay[]
 }
 
 /** Part of a source frame to show, as fractions (0..1). */
@@ -163,6 +188,10 @@ export interface Project {
   /** file name of the main recording (ilfsrec_NNN.mp4); older projects use screen.mp4 */
   screenFile?: string
   recId?: string
+  /** made from the user's own videos (not a screen recording) */
+  imported?: boolean
+  /** original file name of the first video in a video project */
+  mainName?: string
 }
 
 export interface ProjectSummary {
@@ -205,7 +234,8 @@ export function defaultEdit(p: Pick<Project, 'cursorBaked' | 'camera' | 'duratio
       zoom: { enabled: false, id: 'deep', volume: 0.4 },
       typing: { enabled: true, id: 'thock', volume: 0.35 }
     },
-    clips: [{ id: 'c-main', source: 'main', in: 0, out: p.duration }]
+    clips: [{ id: 'c-main', source: 'main', in: 0, out: p.duration }],
+    texts: []
   }
 }
 
@@ -230,6 +260,7 @@ export function migrateEdit(p: Project, e: any): EditState {
     audio: { ...d.audio, ...old.audio, clips: old.audio?.clips ?? [] },
     clips: old.clips?.length ? old.clips : [{ id: 'c-main', source: 'main', in: old.trim?.start ?? 0, out: old.trim?.end ?? p.duration }],
     crops: old.crops ?? {},
+    texts: Array.isArray(old.texts) ? old.texts : [],
     sfx: { click: { ...d.sfx.click, ...sfx.click }, zoom: { ...d.sfx.zoom, ...sfx.zoom }, typing: { ...d.sfx.typing, ...sfx.typing } }
   }
 }

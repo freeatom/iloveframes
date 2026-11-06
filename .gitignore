@@ -5,3 +5,4 @@ release
 .tmp
 keys/update-private.pem
 *.log
+keys/mac-signing*

@@ -1,5 +1,10 @@
-# Builds the macOS app (Apple Silicon + Intel) as .dmg (install) and .zip (auto-update).
-# Run it from the GitHub "Actions" tab → "Build macOS" → Run workflow, then download the artifacts.
+# Builds the macOS app (Apple Silicon + Intel) as .dmg (install) and .zip (auto-update),
+# then smoke-tests it on a real Mac: the packaged app must launch, find ffmpeg and a screen
+# device, and the click/key helper must start. Run it from Actions → "Build macOS".
+#
+# Optional secrets MAC_CERT_P12 (base64 .p12) + MAC_CERT_PASSWORD: a self-signed
+# "iloveframes" code-signing identity. Signing every release with the same key keeps
+# macOS permissions (Screen Recording etc.) across updates. Without them: ad-hoc signed.
 name: Build macOS
 
 on:
@@ -11,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
-    runs-on: macos-14
+    runs-on: macos-14 # Apple Silicon runner; the x64 build gets the Intel ffmpeg below
     steps:
       - uses: actions/checkout@v4
 
@@ -30,11 +35,60 @@ jobs:
           npm_config_arch=x64 node node_modules/ffmpeg-static/install.js
           file node_modules/ffmpeg-static/ffmpeg
 
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Import the iloveframes signing identity
+        env:
+          P12: ${{ secrets.MAC_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        if: env.P12 != ''
+        run: |
+          KC="$RUNNER_TEMP/ilf.keychain-db"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/ilf.p12"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          security import "$RUNNER_TEMP/ilf.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          openssl pkcs12 -in "$RUNNER_TEMP/ilf.p12" -clcerts -nokeys -passin env:P12_PASSWORD -legacy 2>/dev/null > "$RUNNER_TEMP/ilf.pem" || openssl pkcs12 -in "$RUNNER_TEMP/ilf.p12" -clcerts -nokeys -passin env:P12_PASSWORD > "$RUNNER_TEMP/ilf.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/ilf.pem"
+          ID=$(openssl x509 -in "$RUNNER_TEMP/ilf.pem" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
+          echo "ILF_MAC_SIGN_ID=$ID" >> "$GITHUB_ENV"
+          echo "ILF_MAC_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          security find-identity -p codesigning "$KC"
+
       - name: Build app
         run: npx electron-vite build
 
-      - name: Package (.dmg + .zip, ad-hoc signed)
+      - name: Package (.dmg + .zip)
         run: npx electron-builder --mac --${{ matrix.arch }} --publish never
+
+      - name: Smoke test - signature
+        run: |
+          APP=$(ls -d release/*/mac*/iloveframes.app | head -n 1)
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Identifier|Authority|Signature|TeamIdentifier" || true
+          codesign -d -r- "$APP" 2>&1 | tail -n 1
+
+      - name: Smoke test - click and key helper
+        run: |
+          APP=$(ls -d release/*/mac*/iloveframes.app | head -n 1)
+          ( osascript -l JavaScript "$APP/Contents/Resources/native/cursor-mac.js" > helper.log 2>&1 & echo $! > helper.pid )
+          sleep 5
+          kill "$(cat helper.pid)" 2>/dev/null || true
+          cat helper.log
+          grep -q '^ready' helper.log
+          grep -q '^caps ' helper.log
+
+      - name: Smoke test - packaged app launches
+        if: matrix.arch == 'arm64' # runs natively on this runner
+        run: |
+          APP=$(ls -d release/*/mac*/iloveframes.app | head -n 1)
+          ILF_SMOKE=1 ILF_NO_MOVE=1 "$APP/Contents/MacOS/iloveframes" > smoke.log 2>&1 &
+          for i in $(seq 1 60); do grep -q 'ILF_SMOKE' smoke.log && break; sleep 1; done
+          cat smoke.log | grep -v -i 'electron.*deprecat' | tail -n 40
+          grep -q 'ILF_SMOKE_OK' smoke.log
 
       - uses: actions/upload-artifact@v4
         with:

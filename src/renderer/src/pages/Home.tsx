@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Camera, CameraOff, Check, ChevronRight, Crop as CropIcon, Maximize, Clock, Film, FolderOpen, Image as ImageIcon, Mic, MicOff, Monitor, RefreshCw, ShieldAlert, SlidersHorizontal, Sparkles, Trash2, Wand2, Zap
+  Camera, CameraOff, Check, ChevronRight, Clapperboard, UploadCloud, Crop as CropIcon, Maximize, Clock, Film, FolderOpen, Image as ImageIcon, Mic, MicOff, Monitor, RefreshCw, ShieldAlert, SlidersHorizontal, Sparkles, Trash2, Wand2, Zap
 } from 'lucide-react'
 import { Titlebar, LogoMark, Wordmark } from '@/components/Brand'
 import { Button } from '@/components/ui/button'
@@ -26,7 +26,9 @@ const TIPS = [
   'Click the round button between two clips to add a transition.',
   'Paste a screenshot with Ctrl+V in Screenshot Studio to beautify it.',
   'Space plays and pauses the preview.',
-  'Export a GIF for READMEs and help docs.'
+  'Export a GIF for READMEs and help docs.',
+  'Drop your own videos on this window to start a video project.',
+  'Press T in the editor to add a title at the playhead.'
 ]
 
 function greeting(d = new Date()) {
@@ -144,6 +146,10 @@ export default function Home() {
   const [stage, setStage] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [perms, setPerms] = useState<any>(null)
+  // bring-your-own-video projects: import progress and the drop target
+  const [importing, setImporting] = useState<{ label: string; p: number } | null>(null)
+  const [dropping, setDropping] = useState(false)
+  const busyImport = useRef(false)
 
   const refreshDisplays = useCallback(async () => {
     const keep = (list: DisplayInfo[]) => list.map((x) => ({ ...x, thumbnail: x.thumbnail ?? cache.displays.find((c) => c.id === x.id)?.thumbnail ?? null }))
@@ -188,9 +194,11 @@ export default function Home() {
       window.ilf.permStatus().then(setPerms)
     }
     window.addEventListener('focus', onFocus)
+    const offChanged = window.ilf.onProjectsChanged(() => refreshProjects())
     return () => {
       navigator.mediaDevices.removeEventListener('devicechange', refreshDevices)
       window.removeEventListener('focus', onFocus)
+      offChanged()
     }
   }, [refreshDisplays, refreshProjects, refreshDevices])
 
@@ -306,12 +314,44 @@ export default function Home() {
       setPhase('recording')
     } catch (e: any) {
       abortLocal()
-      setError(e?.message ?? String(e))
+      const msg = String(e?.message ?? e)
+      if (msg.includes('MAC_SCREEN_PERMISSION')) {
+        setAskedScreen(true)
+        setPerms((p: any) => ({ ...(p ?? {}), screen: 'denied' }))
+        setError('macOS hasn’t given iloveframes Screen Recording access yet. Allow it in System Settings, then restart the app.')
+      } else setError(msg.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''))
       setPhase('idle')
     }
   }
 
-  const needsPerms = perms && (perms.screen !== 'granted' || !perms.accessibility)
+  useEffect(() => {
+    const off = window.ilf.media.onProgress((st) => st && setImporting(st))
+    return () => {
+      off()
+    }
+  }, [])
+
+  /** Make a new project from your own videos (picked, or dropped on the window). */
+  const newVideoProject = async (paths?: string[]) => {
+    if (busyImport.current || phase !== 'idle') return
+    busyImport.current = true
+    setError(null)
+    setImporting({ label: paths?.length ? `${paths.length} video${paths.length > 1 ? 's' : ''}` : 'your video', p: 0 })
+    try {
+      const id = await window.ilf.media.importAsProject(paths)
+      if (id) navigate('/editor/' + encodeURIComponent(id))
+    } catch (e: any) {
+      setError(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''))
+    } finally {
+      busyImport.current = false
+      setImporting(null)
+    }
+  }
+  const isVideo = (p: string) => /\.(mp4|mov|m4v|webm|mkv|avi)$/i.test(p)
+
+  const needsPerms = perms && perms.screen !== 'granted'
+  // macOS only applies a new Screen Recording permission after a restart
+  const [askedScreen, setAskedScreen] = useState(false)
   const lic = useLicense()
   const firstName = (lic?.name || lic?.license?.customerName || '').split(' ')[0]
   const [hello, setHello] = useState(() => greeting())
@@ -343,7 +383,26 @@ export default function Home() {
   useFirstRunTour('home', phase === 'idle' && displays.length > 0 && !!lic && lic.state !== 'expired')
 
   return (
-    <div className="relative flex h-full flex-col overflow-hidden bg-ink-950">
+    <div
+      className="relative flex h-full flex-col overflow-hidden bg-ink-950"
+      onDragOver={(e) => {
+        if (![...e.dataTransfer.types].includes('Files') || phase !== 'idle') return
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'copy'
+        setDropping(true)
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropping(false)
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        setDropping(false)
+        const paths = [...e.dataTransfer.files].map((f) => window.ilf.pathForFile(f)).filter(Boolean)
+        const vids = paths.filter(isVideo)
+        if (vids.length) newVideoProject(vids)
+        else if (paths.length) setError('Drop video files (MP4, MOV, WebM, MKV or AVI) to start a video project.')
+      }}
+    >
       <div className="pointer-events-none absolute -top-48 left-1/2 h-[520px] w-[980px] -translate-x-1/2">
         <div className="aurora-a h-full w-full rounded-full bg-[radial-gradient(closest-side,rgba(255,77,141,.13),transparent)]" />
       </div>
@@ -381,6 +440,22 @@ export default function Home() {
               </h1>
               <p className="mt-1.5 text-[13px] text-zinc-400">Smooth zooms, a cinematic cursor and polished backgrounds, added for you.</p>
             </div>
+            <div className="flex shrink-0 items-center gap-2.5">
+            <button
+              data-tour="video-project"
+              onClick={() => newVideoProject()}
+              disabled={phase !== 'idle' || !!importing}
+              className="group flex shrink-0 items-center gap-3 rounded-2xl border border-white/[0.07] bg-white/[0.03] py-2.5 pl-2.5 pr-4 text-left transition-all hover:border-amber-300/40 hover:bg-amber-300/[0.05] disabled:opacity-50"
+            >
+              <div className="grid h-9 w-9 place-items-center rounded-xl bg-amber-300/15 text-amber-200 transition-colors group-hover:bg-amber-300 group-hover:text-black">
+                <Clapperboard className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-[12.5px] font-semibold text-zinc-100">Video project</div>
+                <div className="text-[11px] text-zinc-500">Edit your own videos</div>
+              </div>
+              <ChevronRight className="ml-1 h-4 w-4 text-zinc-600 transition-transform group-hover:translate-x-0.5 group-hover:text-zinc-300" />
+            </button>
             <button
               onClick={() => navigate('/shot')}
               className="group flex shrink-0 items-center gap-3 rounded-2xl border border-white/[0.07] bg-white/[0.03] py-2.5 pl-2.5 pr-4 text-left transition-all hover:border-brand-orchid/40 hover:bg-brand-orchid/[0.06]"
@@ -394,17 +469,32 @@ export default function Home() {
               </div>
               <ChevronRight className="ml-1 h-4 w-4 text-zinc-600 transition-transform group-hover:translate-x-0.5 group-hover:text-zinc-300" />
             </button>
+            </div>
           </motion.div>
 
           {needsPerms && (
             <div className="flex items-center gap-3 rounded-xl border border-brand-rose/25 bg-brand-rose/[0.06] px-4 py-2.5 text-[12.5px] text-rose-100">
               <ShieldAlert className="h-4 w-4 shrink-0" />
-              <div className="flex-1">
-                {perms.screen !== 'granted' ? 'Screen Recording permission is needed. ' : ''}
-                {!perms.accessibility ? 'Accessibility permission lets us capture clicks for auto-zoom.' : ''}
+              <div className="min-w-0 flex-1">
+                <div className="font-medium">Allow Screen Recording to record on this Mac</div>
+                <div className="mt-0.5 text-[11.5px] text-rose-100/70">
+                  {askedScreen
+                    ? 'Turn on iloveframes in System Settings → Privacy & Security → Screen Recording, then restart iloveframes. Already on after an update? Remove it with − and add it again.'
+                    : 'macOS asks once. After you allow it, iloveframes needs a quick restart.'}
+                </div>
               </div>
-              {perms.screen !== 'granted' && <Button size="sm" variant="outline" onClick={() => window.ilf.permRequest('screen')}>Allow screen</Button>}
-              {!perms.accessibility && <Button size="sm" variant="outline" onClick={() => window.ilf.permRequest('accessibility')}>Allow clicks</Button>}
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={async () => {
+                  setAskedScreen(true)
+                  await window.ilf.permRequest('screen')
+                  window.ilf.permOpenSettings('screen')
+                }}
+              >
+                Open Settings
+              </Button>
+              <Button size="sm" variant="primary" onClick={() => window.ilf.relaunch()}>Restart iloveframes</Button>
             </div>
           )}
 
@@ -596,7 +686,7 @@ export default function Home() {
             </div>
             {projects.length === 0 ? (
               <div className="flex items-center gap-3 rounded-xl border border-dashed border-white/[0.08] px-4 py-4 text-[12px] text-zinc-500">
-                <Film className="h-4 w-4 text-zinc-600" /> Your recordings will show up here, ready to edit and export.
+                <Film className="h-4 w-4 text-zinc-600" /> Your recordings and video projects will show up here, ready to edit and export.
               </div>
             ) : (
               <div data-tour="recent" className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-2">
@@ -642,6 +732,36 @@ export default function Home() {
           <Tips />
         </div>
       </main>
+
+      {/* drop your own videos anywhere */}
+      <AnimatePresence>
+        {dropping && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="pointer-events-none absolute inset-3 z-50 grid place-items-center rounded-3xl border-2 border-dashed border-amber-300/60 bg-ink-950/80 backdrop-blur-md">
+            <div className="flex flex-col items-center text-center">
+              <div className="grid h-14 w-14 place-items-center rounded-2xl bg-amber-300/15 text-amber-200"><UploadCloud className="h-7 w-7" /></div>
+              <div className="mt-4 text-[16px] font-semibold text-white">Drop to start a video project</div>
+              <div className="mt-1 text-[12.5px] text-zinc-400">Every video becomes a clip on the timeline, in the order you dropped them</div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {importing && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 z-50 grid place-items-center bg-ink-950/85 backdrop-blur-xl">
+            <div className="flex w-[360px] flex-col items-center text-center">
+              <div className="relative h-16 w-16">
+                <div className="absolute inset-0 animate-spin rounded-[22px] bg-[conic-gradient(from_0deg,transparent,#ffd166,#ff4d8d,transparent)] [animation-duration:1.6s]" />
+                <div className="absolute inset-[3px] grid place-items-center rounded-[19px] bg-ink-950"><Clapperboard className="h-6 w-6 text-amber-200" /></div>
+              </div>
+              <div className="mt-5 text-[15px] font-semibold text-white">Preparing your video project</div>
+              <div className="mt-1 w-full truncate text-[12px] text-zinc-400">Importing {importing.label}</div>
+              <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.08]">
+                <div className="h-full rounded-full bg-gradient-to-r from-amber-300 to-brand-pink transition-[width] duration-300" style={{ width: Math.max(4, importing.p * 100) + '%' }} />
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* processing overlay */}
       <AnimatePresence>

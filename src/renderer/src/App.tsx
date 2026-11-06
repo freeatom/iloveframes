@@ -13,6 +13,7 @@ import { ProCelebration, ProTag } from './components/Pro'
 import { FeedbackDialog } from './components/Feedback'
 import { startAgentListener } from './lib/agent'
 import { Tour } from './components/Tour'
+import { ErrorBoundary } from './components/ErrorBoundary'
 
 function useHashRoute() {
   const [hash, setHash] = useState(location.hash.slice(1) || '/')
@@ -42,7 +43,9 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={250}>
       <div key={path.startsWith('/editor/') ? path : path} className="page-in h-full">
-        {path.startsWith('/editor/') ? <Editor id={decodeURIComponent(path.slice(8))} /> : path === '/account' ? <AccountPage /> : path === '/shot' ? <Shot /> : <Home />}
+        <ErrorBoundary screen={path.startsWith('/editor/') ? 'editor' : path === '/account' ? 'account' : path === '/shot' ? 'shot' : 'home'}>
+          {path.startsWith('/editor/') ? <Editor id={decodeURIComponent(path.slice(8))} /> : path === '/account' ? <AccountPage /> : path === '/shot' ? <Shot /> : <Home />}
+        </ErrorBoundary>
       </div>
       <LicenseGate />
       <UpdateToast />

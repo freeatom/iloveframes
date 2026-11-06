@@ -19,7 +19,8 @@ export const win: Platform = {
     // an optional area crop runs first, then the frame is kept to even dimensions
     const even = (crop ? cropFilter(crop) + ',' : '') + 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
     const enc = ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '16', '-pix_fmt', 'yuv420p']
-    const common = ['-g', String(fps), '-stats_period', '0.05', '-movflags', '+faststart']
+    // fragmented MP4: if the app or the machine dies mid-take, everything up to the last second still plays
+    const common = ['-g', String(fps), '-stats_period', '0.05', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-t', '14400']
     const b = display.bounds
     const s = display.scaleFactor
     return [

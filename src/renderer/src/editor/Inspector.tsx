@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Camera, Check, CircleHelp, Clapperboard, Crop, Crosshair, FilePlus2, Scissors, EyeOff, ImagePlus, X, Upload, Music, GripVertical, Play, Square, Plus, LayoutTemplate, MousePointer2, MousePointerClick, Palette, RotateCcw, Sparkles, Trash2, Volume2, ZoomIn
+  Camera, Check, CircleHelp, Type, AlignCenter, Copy, Clapperboard, Crop, Crosshair, FilePlus2, Scissors, EyeOff, ImagePlus, X, Upload, Music, GripVertical, Play, Square, Plus, LayoutTemplate, MousePointer2, MousePointerClick, Palette, RotateCcw, Sparkles, Trash2, Volume2, ZoomIn
 } from 'lucide-react'
-import { useEditor, updateEdit, patchSegment, removeSegment, addSegmentAt, addHideAt, removeHide, cursorPosAt, addClipAt, patchClip, removeClip, splitAtPlayhead, deleteSeqClip, appendSources, setTransition, setAllTransitions } from './store'
+import { useEditor, updateEdit, addTextAt, patchText, removeText, setClipVolume, patchSegment, removeSegment, addSegmentAt, addHideAt, removeHide, cursorPosAt, addClipAt, patchClip, removeClip, splitAtPlayhead, deleteSeqClip, appendSources, setTransition, setAllTransitions } from './store'
 import { player } from './Preview'
 import { GRADIENTS, SOLIDS, WALLPAPERS, backgroundThumb } from '@/engine/backgrounds'
 import { STUDIO } from '@/engine/studio'
 import { autoZoomSegments } from '@/engine/motion'
 import { playSfx, keyVariant, CLICK_SOUNDS, ZOOM_SOUNDS, TYPING_SOUNDS } from '@/engine/sounds'
-import type { Aspect, CamPos, CursorStyle, DeviceColor, DeviceKind, EditState } from '@/engine/types'
+import type { Aspect, CamPos, CursorStyle, DeviceColor, DeviceKind, EditState, TextOverlay, TextStyle } from '@/engine/types'
+import { TEXT_COLORS, TEXT_PRESETS } from '@/engine/overlays'
 import { LabeledSlider, Slider } from '@/components/ui/slider'
 import { SwitchRow } from '@/components/ui/switch'
 import { Segmented } from '@/components/ui/segmented'
@@ -17,7 +18,7 @@ import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
 import { cn, fmtTime } from '@/lib/utils'
 import { mediaUrl, defaultEdit, uid } from '@/engine/types'
-import { MAIN, clipAt, cropOf, seqEvents, sourceInfo, toCrop, trackOf, type SourceInfo } from '@/engine/sequence'
+import { MAIN, clipAt, cropOf, seqDuration, seqEvents, sourceInfo, toCrop, trackOf, type SourceInfo } from '@/engine/sequence'
 import { TransitionIcon, TransitionPicker } from './Transitions'
 import { openCrop } from './CropEditor'
 import { offerTour, replayTour } from '@/components/Tour'
@@ -25,7 +26,7 @@ import { DEVICE_FRAMES_ENABLED } from '@/engine/devices'
 import { trackOncePerSession } from '@/lib/telemetry'
 import { useSourceThumbs } from './Timeline'
 
-type Tab = 'clips' | 'background' | 'frame' | 'cursor' | 'zoom' | 'camera' | 'audio'
+type Tab = 'clips' | 'background' | 'frame' | 'cursor' | 'zoom' | 'text' | 'camera' | 'audio'
 
 const TABS: { id: Tab; icon: any; label: string }[] = [
   { id: 'clips', icon: Clapperboard, label: 'Clips' },
@@ -33,6 +34,7 @@ const TABS: { id: Tab; icon: any; label: string }[] = [
   { id: 'frame', icon: LayoutTemplate, label: 'Frame' },
   { id: 'cursor', icon: MousePointer2, label: 'Cursor' },
   { id: 'zoom', icon: ZoomIn, label: 'Zoom' },
+  { id: 'text', icon: Type, label: 'Text' },
   { id: 'camera', icon: Camera, label: 'Camera' },
   { id: 'audio', icon: Volume2, label: 'Audio' }
 ]
@@ -897,6 +899,172 @@ function SourceCard({ src, uses, smart, onAdd, onRemove }: { src: SourceInfo; us
   )
 }
 
+const POSITIONS: { x: number; y: number; label: string }[] = [
+  { x: 0.12, y: 0.1, label: 'Top left' }, { x: 0.5, y: 0.1, label: 'Top' }, { x: 0.88, y: 0.1, label: 'Top right' },
+  { x: 0.12, y: 0.5, label: 'Left' }, { x: 0.5, y: 0.5, label: 'Centre' }, { x: 0.88, y: 0.5, label: 'Right' },
+  { x: 0.12, y: 0.86, label: 'Bottom left' }, { x: 0.5, y: 0.86, label: 'Bottom' }, { x: 0.88, y: 0.86, label: 'Bottom right' }
+]
+
+function TextPanel({ edit }: { edit: EditState }) {
+  const selected = useEditor((s) => s.selected)
+  const time = useEditor((s) => s.time)
+  const o = edit.texts.find((t) => t.id === selected)
+  const add = (style: TextStyle) => {
+    const made = addTextAt(useEditor.getState().time, style)
+    if (made) player.seek(made.start + 0.45)
+  }
+  return (
+    <>
+      <Section title="Add text" tour="text-add">
+        <div className="grid grid-cols-2 gap-2">
+          {(Object.keys(TEXT_PRESETS) as TextStyle[]).map((k) => (
+            <button
+              key={k}
+              onClick={() => add(k)}
+              className="group rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2.5 text-left transition-colors hover:border-amber-300/40 hover:bg-amber-300/[0.05]"
+            >
+              <div className={cn('truncate text-zinc-100', k === 'title' ? 'text-[15px] font-bold' : k === 'badge' ? 'text-[10.5px] font-bold uppercase tracking-wider' : 'text-[12.5px] font-semibold')}>{TEXT_PRESETS[k].label}</div>
+              <div className="mt-0.5 truncate text-[10.5px] text-zinc-500">{TEXT_PRESETS[k].hint}</div>
+            </button>
+          ))}
+        </div>
+        <div className="text-[11px] leading-relaxed text-zinc-500">Added at the playhead ({fmtTime(time, true)}). Drag it on the Text lane to move it, drag its edges to change how long it shows. Press T to add a title.</div>
+      </Section>
+      {o ? <TextEditor key={o.id} o={o} /> : null}
+      <Section title={'In this video · ' + edit.texts.length}>
+        {edit.texts.length === 0 ? (
+          <div className="text-[12px] text-zinc-500">No text yet. Titles, captions and name tags show up here.</div>
+        ) : (
+          <div className="space-y-1.5">
+            {edit.texts.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => {
+                  useEditor.getState().select(t.id)
+                  player.seek(t.start + Math.min(0.45, (t.end - t.start) / 2))
+                }}
+                className={cn('flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] transition-colors', t.id === selected ? 'bg-amber-300/[0.12] text-white ring-1 ring-amber-300/40' : 'bg-white/[0.03] text-zinc-300 hover:bg-white/[0.06]')}
+              >
+                <Type className="h-3.5 w-3.5 shrink-0 text-amber-300/80" />
+                <span className="min-w-0 flex-1 truncate">{t.text.split('\n')[0] || 'Empty text'}</span>
+                <span className="shrink-0 text-[10.5px] tabular-nums text-zinc-500">{fmtTime(t.start, true)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </Section>
+    </>
+  )
+}
+
+function TextEditor({ o }: { o: TextOverlay }) {
+  const total = useEditor((s) => seqDuration(s.edit!.clips))
+  const p = (patch: Partial<TextOverlay>, history = true) => patchText(o.id, patch, history)
+  return (
+    <Section
+      title="Selected text"
+      action={
+        <div className="flex items-center gap-1">
+          <Tip content="Duplicate after this one">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => {
+                const made = addTextAt(o.end + 0.05, o.style, o.end - o.start)
+                if (made) patchText(made.id, { text: o.text, x: o.x, y: o.y, size: o.size, color: o.color, bg: o.bg, anim: o.anim })
+              }}
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </Button>
+          </Tip>
+          <Button variant="danger" size="icon-sm" onClick={() => removeText(o.id)}>
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      }
+    >
+      <textarea
+        autoFocus
+        value={o.text}
+        rows={Math.min(4, Math.max(2, o.text.split('\n').length))}
+        onChange={(e) => p({ text: e.target.value.slice(0, 280) }, false)}
+        onBlur={() => useEditor.getState().checkpoint()}
+        placeholder="Type your text"
+        className="w-full resize-none rounded-lg border border-white/[0.08] bg-black/30 px-3 py-2 text-[13px] text-zinc-100 outline-none transition-colors placeholder:text-zinc-600 focus:border-amber-300/50"
+      />
+      <div>
+        <div className="mb-2 text-[11.5px] text-zinc-400">Style</div>
+        <div className="flex flex-wrap gap-1.5">
+          {(Object.keys(TEXT_PRESETS) as TextStyle[]).map((k) => (
+            <button
+              key={k}
+              onClick={() => {
+                const d = TEXT_PRESETS[k]
+                p({ style: k, bg: d.bg, anim: d.anim, ...(o.style === 'lower' || k === 'lower' ? { x: d.x, y: d.y } : {}) })
+              }}
+              className={cn('rounded-lg px-2.5 py-1 text-[11.5px] transition-colors', o.style === k ? 'bg-amber-300 font-semibold text-black' : 'bg-white/[0.05] text-zinc-300 hover:bg-white/[0.09]')}
+            >
+              {TEXT_PRESETS[k].label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="flex items-start gap-4">
+        <div>
+          <div className="mb-2 text-[11.5px] text-zinc-400">Position</div>
+          <div className="grid w-[96px] grid-cols-3 gap-1 rounded-lg bg-black/30 p-1 ring-1 ring-white/[0.06]">
+            {POSITIONS.map((q) => {
+              // a lower third is left-aligned: its anchor is its left edge
+              const qx = o.style === 'lower' ? (q.x < 0.3 ? 0.07 : q.x < 0.7 ? 0.36 : 0.6) : q.x
+              const on = Math.abs(qx - o.x) < 0.05 && Math.abs(q.y - o.y) < 0.05
+              return (
+                <Tip key={q.label} content={q.label}>
+                  <button onClick={() => p({ x: qx, y: q.y })} className={cn('grid h-[26px] place-items-center rounded-md transition-colors', on ? 'bg-amber-300' : 'hover:bg-white/10')}>
+                    <span className={cn('h-1.5 w-1.5 rounded-full', on ? 'bg-black' : 'bg-white/40')} />
+                  </button>
+                </Tip>
+              )
+            })}
+          </div>
+        </div>
+        <div className="min-w-0 flex-1 space-y-3">
+          <LabeledSlider label="Left / right" value={o.x} min={0} max={1} step={0.005} onChange={(v) => p({ x: v }, false)} format={(v) => Math.round(v * 100) + '%'} />
+          <LabeledSlider label="Up / down" value={o.y} min={0} max={1} step={0.005} onChange={(v) => p({ y: v }, false)} format={(v) => Math.round(v * 100) + '%'} />
+        </div>
+      </div>
+      <LabeledSlider label="Size" value={o.size} min={0.4} max={2.5} step={0.01} onChange={(v) => p({ size: v }, false)} format={(v) => Math.round(v * 100) + '%'} />
+      <div>
+        <div className="mb-2 text-[11.5px] text-zinc-400">Colour</div>
+        <div className="flex flex-wrap gap-2">
+          {TEXT_COLORS.map((c) => (
+            <button key={c} onClick={() => p({ color: c })} title={c} className={cn('h-7 w-7 rounded-full ring-2 ring-offset-2 ring-offset-[#0e0e13] transition-transform hover:scale-110', o.color === c ? 'ring-amber-300' : 'ring-white/10')} style={{ background: c }} />
+          ))}
+          <label className="relative grid h-7 w-7 cursor-pointer place-items-center overflow-hidden rounded-full bg-[conic-gradient(#ff4d8d,#ffd166,#5eead4,#60a5fa,#c084fc,#ff4d8d)] ring-2 ring-white/10 ring-offset-2 ring-offset-[#0e0e13]" title="Pick any colour">
+            <input type="color" value={o.color} onChange={(e) => p({ color: e.target.value }, false)} onBlur={() => useEditor.getState().checkpoint()} className="absolute inset-0 cursor-pointer opacity-0" />
+          </label>
+        </div>
+      </div>
+      <div>
+        <div className="mb-2 text-[11.5px] text-zinc-400">Backdrop</div>
+        <Segmented size="sm" layoutId="txt-bg" value={o.bg} onChange={(v) => p({ bg: v as TextOverlay['bg'] })} options={[{ value: 'none', label: 'None' }, { value: 'shadow', label: 'Glow' }, { value: 'pill', label: 'Pill' }, { value: 'box', label: 'Box' }]} />
+      </div>
+      <div>
+        <div className="mb-2 text-[11.5px] text-zinc-400">Animation</div>
+        <Segmented size="sm" layoutId="txt-anim" value={o.anim} onChange={(v) => p({ anim: v as TextOverlay['anim'] })} options={[{ value: 'fade', label: 'Fade' }, { value: 'rise', label: 'Rise' }, { value: 'pop', label: 'Pop' }, { value: 'type', label: 'Type' }, { value: 'none', label: 'Cut' }]} />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <Button variant="outline" size="sm" onClick={() => p({ start: Math.max(0, Math.min(useEditor.getState().time, o.end - 0.4)) })}>
+          <AlignCenter className="h-3.5 w-3.5" /> Start here
+        </Button>
+        <Button variant="outline" size="sm" onClick={() => p({ end: Math.min(total, Math.max(useEditor.getState().time, o.start + 0.4)) })}>
+          <AlignCenter className="h-3.5 w-3.5" /> End here
+        </Button>
+      </div>
+      <div className="text-[11px] tabular-nums text-zinc-500">Shows {fmtTime(o.start, true)} → {fmtTime(o.end, true)} · {(o.end - o.start).toFixed(1)}s</div>
+    </Section>
+  )
+}
+
 function ClipsPanel({ edit }: { edit: EditState }) {
   const project = useEditor((s) => s.project)!
   const selected = useEditor((s) => s.selected)
@@ -918,6 +1086,9 @@ function ClipsPanel({ edit }: { edit: EditState }) {
             <Button variant="outline" size="sm" onClick={() => splitAtPlayhead()}><Scissors className="h-3.5 w-3.5" /> Split at playhead</Button>
             <Button variant="danger" size="sm" disabled={edit.clips.length < 2} onClick={() => deleteSeqClip(sel.id)}><Trash2 className="h-3.5 w-3.5" /> Delete clip</Button>
           </div>
+          {selSrc.hasAudio && (
+            <LabeledSlider label="Clip volume" value={sel.volume ?? 1} min={0} max={2} step={0.01} onChange={(v) => setClipVolume(sel.id, v, false)} format={(v) => (v === 0 ? 'Muted' : Math.round(v * 100) + '%')} />
+          )}
         </Section>
       )}
       <Section
@@ -1085,7 +1256,7 @@ export function Inspector() {
   const selected = useEditor((s) => s.selected)
   const [tab, setTab] = useState<Tab>('background')
   const active: Tab = selected && tab !== 'zoom' ? tab : tab
-  const Panel = { clips: ClipsPanel, background: BackgroundPanel, frame: FramePanel, cursor: CursorPanel, zoom: ZoomPanel, camera: CameraPanel, audio: AudioPanel }[active]
+  const Panel = { clips: ClipsPanel, background: BackgroundPanel, frame: FramePanel, cursor: CursorPanel, zoom: ZoomPanel, text: TextPanel, camera: CameraPanel, audio: AudioPanel }[active]
 
   // the editor walkthrough opens each tab as it explains it
   useEffect(() => {
@@ -1101,7 +1272,7 @@ export function Inspector() {
   const [lastSel, setLastSel] = useState<string | null>(null)
   if (selected !== lastSel) {
     setLastSel(selected)
-    if (selected) setTab(edit.clips.some((c) => c.id === selected) ? 'clips' : edit.cursor.hidden.some((r) => r.id === selected) ? 'cursor' : edit.audio.clips.some((c) => c.id === selected) ? 'audio' : 'zoom')
+    if (selected) setTab(edit.clips.some((c) => c.id === selected) ? 'clips' : edit.cursor.hidden.some((r) => r.id === selected) ? 'cursor' : edit.audio.clips.some((c) => c.id === selected) ? 'audio' : edit.texts.some((t) => t.id === selected) ? 'text' : 'zoom')
   }
 
   return (

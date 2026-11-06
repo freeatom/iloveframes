@@ -4,6 +4,7 @@ import { MotionTracks } from './motion'
 import { drawFrame, drawTransition, outputSize, type FrameSources } from './compositor'
 import { encodeWav, renderAudioMix } from './sounds'
 import { loadBgImage } from './backgrounds'
+import { loadOverlayFonts, paintOverlays } from './overlays'
 import { demux, FrameSource, type Demuxed } from './decode'
 import { MAIN, cameraOf, clipAt, cropOf, seqDuration, sourceInfo, transitionAt, transitionCuts, type SourceInfo } from './sequence'
 
@@ -35,6 +36,7 @@ export async function exportProject(
 ): Promise<string> {
   onProgress({ p: 0, stage: 'Preparing' })
   if (edit.background.kind === 'image') await loadBgImage(edit.background.value).decode().catch(() => {})
+  await loadOverlayFonts(edit)
   const clips = edit.clips
   const used = [...new Set(clips.map((c) => c.source))].map((id) => sourceInfo(project, id)).filter(Boolean) as SourceInfo[]
   const demuxed = new Map<string, Demuxed>()
@@ -137,6 +139,7 @@ export async function exportProject(
           edit, tracks, 'medium'
         )
       } else drawFrame(ctx, W, H, T, project, edit, tracks, liveSrc, 'medium')
+      paintOverlays(ctx, W, H, T, edit)
       inflight.push(window.ilf.export.frame(token, ctx.getImageData(0, 0, W, H).data.buffer as ArrayBuffer))
       if (inflight.length >= 3) await inflight.shift()
       const now = performance.now()

@@ -7,6 +7,7 @@ import { drawFrame, drawTransition, outputSize, type FrameSources } from '@/engi
 import { projectFile } from '@/engine/types'
 import { playSfx, keyVariant, zoomCues, liveCtx, loadUserSound } from '@/engine/sounds'
 import { loadBgImage } from '@/engine/backgrounds'
+import { paintOverlays } from '@/engine/overlays'
 import { MAIN, cameraOf, clipAt, cropOf, seqDuration, seqEvents, sourceInfo, transitionAt, transitionCuts } from '@/engine/sequence'
 import { fmtTime } from '@/lib/utils'
 
@@ -442,6 +443,7 @@ export function Preview() {
       if (!c || !v) return
       const ctx = c.getContext('2d')!
       if (mic) mic.volume = e.audio.muted ? 0 : Math.min(1, e.audio.micVolume)
+      if (v) v.volume = Math.max(0, Math.min(1, hit.clip.volume ?? 1))
       const camInfo = cameraOf(p, hit.clip.source)
       const cam = cams.current.get(hit.clip.source)
       const camImg = cam ? camFrame(hit.clip.source, cam) : null
@@ -471,10 +473,12 @@ export function Preview() {
           const TA = Math.min(T, trn.cut - 1e-4)
           const TB = Math.max(T, trn.cut)
           drawTransition(ctx, c.width, c.height, trn.kind, trn.p, { t: TA, src: liveIsA ? liveSrc : heldSrc }, { t: TB, src: liveIsA ? heldSrc : liveSrc }, e, tr)
+          paintOverlays(ctx, c.width, c.height, T, e)
           return
         }
       }
       drawFrame(ctx, c.width, c.height, T, p, e, tr, liveSrc)
+      paintOverlays(ctx, c.width, c.height, T, e)
     }
     loop()
     return () => {

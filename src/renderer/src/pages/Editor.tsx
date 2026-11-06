@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ChevronLeft, Crop, Download, FilePlus2, Maximize2, Pause, Play, Redo2, Scissors, SkipBack, SkipForward, SlidersHorizontal, Sparkles, Trash2, Undo2, ZoomIn } from 'lucide-react'
+import { ChevronLeft, Crop, Download, FilePlus2, Film, Type, Maximize2, Pause, Play, Redo2, Scissors, SkipBack, SkipForward, SlidersHorizontal, Sparkles, Trash2, Undo2, ZoomIn } from 'lucide-react'
 import { Titlebar, LogoMark } from '@/components/Brand'
 import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
-import { useEditor, addSegmentAt, removeSelected, addHideAt, splitAtPlayhead, deleteSeqClip, appendSources } from '@/editor/store'
+import { useEditor, addSegmentAt, removeSelected, addHideAt, addTextAt, splitAtPlayhead, deleteSeqClip, appendSources } from '@/editor/store'
 import { Preview, player } from '@/editor/Preview'
 import { Timeline } from '@/editor/Timeline'
 import { Inspector } from '@/editor/Inspector'
 import { ExportDialog } from '@/editor/ExportDialog'
-import { migrateEdit, type Project } from '@/engine/types'
+import { migrateEdit, uid, type Project } from '@/engine/types'
 import { autoZoomSegments } from '@/engine/motion'
 import { cn, fmtTime, modKey } from '@/lib/utils'
 import { seqDuration } from '@/engine/sequence'
@@ -82,6 +82,9 @@ function Transport({ onToast }: { onToast: (m: string) => void }) {
           <div className="mx-1 h-5 w-px bg-white/10" />
           <ToolBtn tip="Add zoom at playhead (Z)" onClick={() => addSegmentAt(useEditor.getState().time)}>
             <ZoomIn className="h-4 w-4" />
+          </ToolBtn>
+          <ToolBtn tip="Add text at playhead (T)" onClick={() => { if (addTextAt(useEditor.getState().time, 'title')) onToast('Title added. Type your text on the right') }}>
+            <Type className="h-4 w-4" />
           </ToolBtn>
           <ToolBtn
             tip="Import video clips"
@@ -163,11 +166,14 @@ export default function Editor({ id }: { id: string }) {
         if (dead) return
         const fresh = !p.edit
         const e = migrateEdit(p, p.edit)
-        if (fresh && p.mode === 'auto') e.zoom.segments = autoZoomSegments(p, e.clips)
+        // a project made from several of your own videos opens with all of them on the timeline
+        if (fresh && p.imported && p.sources?.length) e.clips = [...e.clips, ...p.sources.map((s) => ({ id: uid(), source: s.id, in: 0, out: s.duration }))]
+        if (fresh && (p.mode === 'auto' || p.imported)) e.zoom.segments = autoZoomSegments(p, e.clips)
+        if (fresh && p.imported && p.sources?.some((s) => s.track && !s.track.cursorBaked)) e.cursor.enabled = true
         loadedId.current = p.id
         setName(p.name)
         useEditor.getState().load(p, e)
-        track('project_opened', { fresh, clips: e.clips.length, camera: !!p.camera, mic: !!p.mic, len: Math.round(p.duration), imported: !p.recId })
+        track('project_opened', { fresh, clips: e.clips.length, camera: !!p.camera, mic: !!p.mic, len: Math.round(p.duration), imported: !p.recId, videoProject: !!p.imported, texts: e.texts.length })
       })
       .catch((err) => setError(String(err?.message ?? err)))
     return () => {
@@ -210,6 +216,8 @@ export default function Editor({ id }: { id: string }) {
         removeSelected()
       } else if (e.key.toLowerCase() === 'h' && !mod) {
         addHideAt(s.time)
+      } else if (e.key.toLowerCase() === 't' && !mod) {
+        if (addTextAt(s.time, 'title')) flash('Title added. Type your text on the right')
       } else if (e.key.toLowerCase() === 'z' && !mod) {
         addSegmentAt(s.time)
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
@@ -261,7 +269,7 @@ export default function Editor({ id }: { id: string }) {
           className="no-drag w-[260px] truncate rounded-md bg-transparent px-2 py-1 text-[13px] font-medium text-zinc-100 outline-none transition-colors hover:bg-white/[0.04] focus:bg-white/[0.06]"
         />
         <span className="flex items-center gap-1 rounded-full border border-white/[0.07] bg-white/[0.03] px-2 py-0.5 text-[10.5px] font-medium text-zinc-400">
-          {project.mode === 'auto' ? <><Sparkles className="h-3 w-3 text-brand-lilac" /> Auto</> : <><SlidersHorizontal className="h-3 w-3" /> Manual</>}
+          {project.imported ? <><Film className="h-3 w-3 text-amber-300" /> Video project</> : project.mode === 'auto' ? <><Sparkles className="h-3 w-3 text-brand-lilac" /> Auto</> : <><SlidersHorizontal className="h-3 w-3" /> Manual</>}
         </span>
         <div className="flex-1" />
         <div className="no-drag flex items-center gap-1">

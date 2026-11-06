@@ -14,7 +14,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { CONFIG } from './config'
 
-type Ev = { n: string; t: number; p?: Record<string, unknown> }
+type Ev = { n: string; t: number; p?: Record<string, unknown>; eid?: string }
 interface State {
   id: string
   optOut: boolean
@@ -70,11 +70,12 @@ function clean(p?: Record<string, unknown>) {
 }
 
 // only real (packaged) installs report; dev builds and test runs stay out of the stats unless asked
-const ENABLED = () => app.isPackaged || process.env.ILF_TELEMETRY === '1'
+const ENABLED = () => (app.isPackaged || process.env.ILF_TELEMETRY === '1') && !process.env.ILF_SMOKE
 
 export function track(name: string, props?: Record<string, unknown>) {
   if (!s || s.optOut || !ENABLED() || !NAME.test(name)) return
-  s.queue.push({ n: name, t: Date.now(), p: clean(props) })
+  // a stable id per event lets the server drop duplicates when a batch is retried
+  s.queue.push({ n: name, t: Date.now(), p: clean(props), eid: randomUUID() })
   if (s.queue.length > MAX_QUEUE) s.queue.splice(0, s.queue.length - MAX_QUEUE)
   saveSoon()
 }
@@ -172,6 +173,7 @@ export function initTelemetry(o: { license: () => string }) {
   app.on('browser-window-created', () => setAway(false))
 
   process.on('uncaughtException', (err) => track('error', { msg: String(err?.message || err).slice(0, 120), where: 'main' }))
+  process.on('unhandledRejection', (err: any) => track('error', { msg: String(err?.message || err).slice(0, 120), where: 'main-promise' }))
   app.on('render-process-gone', (_e, _wc, d) => track('crash', { msg: d.reason, code: d.exitCode }))
   app.on('child-process-gone', (_e, d) => {
     if (d.reason !== 'clean-exit' && d.reason !== 'killed') track('crash', { msg: `${d.type}: ${d.reason}`, code: d.exitCode })

@@ -17,7 +17,8 @@ export const mac: Platform = {
   async captureAttempts(_display, idx, out, fps, crop) {
     // an optional area crop runs first, then the frame is kept to even dimensions
     const even = (crop ? cropFilter(crop) + ',' : '') + 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
-    const common = ['-g', String(fps), '-stats_period', '0.05', '-movflags', '+faststart']
+    // fragmented MP4: if the app or the machine dies mid-take, everything up to the last second still plays
+    const common = ['-g', String(fps), '-stats_period', '0.05', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-t', '14400']
     const screens = await avfoundationScreens()
     const dev = screens[idx] ?? screens[0]
     if (dev === undefined) throw new Error('No capturable screen found (allow Screen Recording in System Settings)')

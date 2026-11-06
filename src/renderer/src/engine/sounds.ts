@@ -359,7 +359,7 @@ export async function renderAudioMix(project: Project, edit: EditState, micBuffe
     const fade = { in: transitionHalf(edit.clips, i), out: transitionHalf(edit.clips, i + 1) }
     if (c.source === MAIN && hasMic && micBuffer && project.mic) place(micBuffer, starts[i], edit.audio.micVolume, c.in - project.mic.offset, len, fade)
     const own = sourceAudio.get(c.source)
-    if (own) place(own, starts[i], 1, c.in, len, fade)
+    if (own && (c.volume ?? 1) > 0) place(own, starts[i], c.volume ?? 1, c.in, len, fade)
   })
   if (hasClicks) for (const c of ev.clicks) place(sfxBuffer(sfx.click.id), c.t, sfx.click.volume)
   if (hasKeys)
