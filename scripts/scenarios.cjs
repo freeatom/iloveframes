@@ -1064,3 +1064,42 @@ module.exports.recordquick = async (app, win, out) => {
   console.log('FILES', fs.readdirSync(info.id ? require('path').join(require('os').homedir(), 'Videos', 'iloveframes', info.id) : '.').join(','))
   await win.screenshot({ path: path.join(out, 'editor-110.png') })
 }
+
+// control bar look: start a take, screenshot the bar window with transparency, stop + discard
+module.exports.controlbar = async (app, win, out) => {
+  await win.evaluate(() => { localStorage.setItem('ilf.countdown', '"0"'); localStorage.setItem('ilf.camOn', 'false'); localStorage.setItem('ilf.micEnabled', 'false'); localStorage.setItem('ilf.captureMode', '"full"'); location.reload() }).catch(() => {})
+  await win.waitForTimeout(3500)
+  await win.getByText('Start recording').click()
+  let bar = null
+  for (let i = 0; i < 40 && !bar; i++) {
+    await win.waitForTimeout(250)
+    bar = app.windows().find((w) => w.url().includes('controlbar'))
+  }
+  await bar.waitForTimeout(1200)
+  const size = await bar.evaluate(() => ({ w: innerWidth, h: innerHeight, dpr: devicePixelRatio }))
+  console.log('BAR', JSON.stringify(size))
+  await bar.screenshot({ path: path.join(out, 'controlbar.png'), omitBackground: true })
+  await win.evaluate(() => window.ilf.rec.cancel())
+  await win.waitForTimeout(2500)
+}
+
+// real OS click on the control bar's Stop button (checks click-through doesn't swallow it)
+module.exports.barclick = async (app, win, out) => {
+  await win.evaluate(() => { localStorage.setItem('ilf.countdown', '"0"'); localStorage.setItem('ilf.camOn', 'false'); localStorage.setItem('ilf.micEnabled', 'false'); localStorage.setItem('ilf.captureMode', '"full"'); location.reload() }).catch(() => {})
+  await win.waitForTimeout(3500)
+  await win.getByText('Start recording').click()
+  await win.waitForTimeout(2500)
+  const b = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map((w) => ({ url: w.webContents.getURL(), b: w.getBounds() })).find((x) => x.url.includes('controlbar')).b)
+  const stop = await app.windows().find((w) => w.url().includes('controlbar')).evaluate(() => { const r = [...document.querySelectorAll('button')][0].getBoundingClientRect(); const z = 1; return { x: (r.left + r.width / 2) * z, y: (r.top + r.height / 2) * z } })
+  const sx = Math.round(b.x + stop.x), sy = Math.round(b.y + stop.y)
+  console.log('BOUNDS', JSON.stringify(b), 'STOP AT', sx, sy)
+  require('child_process').execFileSync('powershell', ['-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'click.ps1'), String(sx), String(sy)])
+  for (let i = 0; i < 40; i++) {
+    await win.waitForTimeout(1000)
+    if ((await win.evaluate(() => location.hash)).includes('editor')) break
+  }
+  const hash = await win.evaluate(() => location.hash)
+  console.log('AFTER CLICK', hash.includes('editor') ? 'STOPPED -> editor' : 'still recording: ' + hash)
+  if (!hash.includes('editor')) await win.evaluate(() => window.ilf.rec.cancel())
+  else { const id = decodeURIComponent(hash.split('/editor/')[1]); await win.evaluate(() => { location.hash = '/' }); await win.waitForTimeout(800); await win.evaluate((id) => window.ilf.projects.remove(id), id) }
+}

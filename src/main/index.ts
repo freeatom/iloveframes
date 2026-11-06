@@ -232,12 +232,17 @@ async function showCountdown(display: Display, seconds: number) {
 }
 
 function openControlBar(display: Display, startWall: number) {
-  // a slim vertical pill on the right edge, out of the way of what you're showing
-  const W = 84
-  const H = 324
+  // a slim vertical pill on the right edge, out of the way of what you're showing.
+  // The window is the pill (59 x 227) plus a transparent margin wide enough for its soft
+  // shadow to fade out completely (a tight window clipped the shadow into a hard box).
+  const PILL_W = 59
+  const PILL_H = 227
+  const M = CONTROL_MARGIN
+  const W = PILL_W + M * 2
+  const H = PILL_H + M * 2
   const b = display.workArea
   controlWin = new BrowserWindow({
-    x: Math.round(b.x + b.width - W - 12),
+    x: Math.round(b.x + b.width - PILL_W - 12 - M),
     y: Math.round(b.y + b.height / 2 - H / 2),
     width: W, height: H, frame: false, transparent: true, resizable: false, alwaysOnTop: true,
     skipTaskbar: true, hasShadow: false, minimizable: false, maximizable: false, fullscreenable: false, show: false,
@@ -245,6 +250,8 @@ function openControlBar(display: Display, startWall: number) {
   })
   controlWin.setContentProtection(true)
   controlWin.setAlwaysOnTop(true, 'screen-saver')
+  // clicks on the see-through margin go to whatever is underneath; the pill turns them back on
+  controlWin.setIgnoreMouseEvents(true, { forward: true })
   // macOS: skipTransformProcessType keeps the Dock icon and main window intact (without it
   // Electron briefly turns the app into a background agent, which can leave the editor hidden)
   controlWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
@@ -253,9 +260,29 @@ function openControlBar(display: Display, startWall: number) {
     controlWin?.showInactive()
     controlWin?.setContentProtection(true) // after show, or Windows still captures it
   })
-  controlWin.on('closed', () => (controlWin = null))
-  if (rec) rec.tracker.ignoreRects = [controlWin.getBounds()]
+  // the pill takes clicks, the see-through margin around it lets them through (follows the
+  // pill when it's dragged); checked from the cursor position so drag areas work everywhere
+  const win = controlWin
+  let over: boolean | null = null
+  const hover = setInterval(() => {
+    if (win.isDestroyed()) return clearInterval(hover)
+    const p = screen.getCursorScreenPoint()
+    const wb = win.getBounds()
+    const inside = p.x >= wb.x + M - 2 && p.x <= wb.x + M + PILL_W + 2 && p.y >= wb.y + M - 2 && p.y <= wb.y + M + PILL_H + 2
+    if (inside !== over) {
+      over = inside
+      win.setIgnoreMouseEvents(!inside, { forward: true })
+    }
+  }, 50)
+  controlWin.on('closed', () => {
+    clearInterval(hover)
+    controlWin = null
+  })
+  // clicks on the pill itself never count as clicks in the recording
+  const wb = controlWin.getBounds()
+  if (rec) rec.tracker.ignoreRects = [{ x: wb.x + M, y: wb.y + M, width: PILL_W, height: PILL_H }]
 }
+const CONTROL_MARGIN = 26
 
 async function beginStop() {
   if (!rec || rec.stopping) return

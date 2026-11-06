@@ -18,12 +18,15 @@ export default function ControlBar({ start }: { start: number }) {
   }, [])
   const elapsed = Math.max(0, (now - (start || now)) / 1000)
   return (
-    <div className="grid h-screen w-screen place-items-center p-1.5">
+    // the window leaves a transparent margin around the pill so its shadow can fade out softly;
+    // the pill is drawn at 70% (zoom) of its original 84 x 324 design
+    <div className="grid h-screen w-screen place-items-center overflow-hidden">
       <motion.div
-        initial={{ x: 24, opacity: 0, scale: 0.96 }}
+        initial={{ x: 18, opacity: 0, scale: 0.96 }}
         animate={{ x: 0, opacity: 1, scale: 1 }}
         transition={{ type: 'spring', stiffness: 380, damping: 30 }}
-        className="drag relative flex h-full w-full flex-col items-center rounded-[34px] border border-white/10 bg-[#0d0d12]/95 py-3 shadow-[0_16px_44px_rgba(0,0,0,.6)]"
+        style={{ zoom: 0.7, width: 84, height: 324 }}
+        className="drag relative flex flex-col items-center rounded-[34px] bg-[#0d0d12]/95 py-3 shadow-[0_0_0_1px_rgba(255,255,255,.09),0_10px_24px_-4px_rgba(0,0,0,.5),0_2px_6px_rgba(0,0,0,.35)]"
       >
         <div className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.05]" title="Drag to move">
           <LogoMark className="h-5 w-5" />
